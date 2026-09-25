@@ -1,0 +1,4 @@
+pyelftools
+capstone
+unicorn
+angr

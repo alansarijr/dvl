@@ -1,0 +1,15 @@
+{
+  "fixture": "03_unreachable",
+  "description": "Real, severe stack overflow inside a function that is never reachable from the reset vector, main(), or any IVT entry (exceptions/IRQs). Tests the static reachability pre-filter from the prompt's pipeline step 2.",
+  "cases": [
+    {
+      "binary": "bad.elf",
+      "function": "dead_vulnerable_function",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "expected_confidence": "high",
+      "reason": "No call edge exists from Reset_Handler/main or any of the 8 vector-table entries (NMI..SysTick, IRQ0..IRQ7) to dead_vulnerable_function. Static CFG reachability analysis (built from ALL entry points, not just main) must classify this as unreachable and short-circuit before emulation, per the pipeline's fast-triage design.",
+      "notes": "IMPORTANT: this must be refuted via the CFG/xref graph, not by observing 'the emulator never got there in one run' -- the latter is not proof of unreachability."
+    }
+  ]
+}

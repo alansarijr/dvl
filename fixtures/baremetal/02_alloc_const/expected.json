@@ -1,0 +1,14 @@
+{
+  "fixture": "02_alloc_const",
+  "description": "Large (4096-byte) but compile-time-constant stack allocation. FP-bait mirroring the real CWE-789 findings in row_413_bad.arm.elf (sub sp, sp, #8384 / #92), where the immediate is not attacker-controlled.",
+  "cases": [
+    {
+      "binary": "good.elf",
+      "function": "large_but_constant_frame",
+      "cwe": "CWE-789",
+      "expected_verdict": "FP",
+      "expected_confidence": "high",
+      "reason": "The stack allocation size (4096) is a constant immediate encoded directly in the 'sub sp, sp, #4096' instruction. No register/memory taint from any input reaches the allocation size, so CWE-789 (excessive/attacker-controlled allocation size) cannot hold regardless of what the emulator feeds as input. Only the first 10 bytes of the buffer are ever written, well within bounds."
+    }
+  ]
+}

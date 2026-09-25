@@ -1,0 +1,26 @@
+{
+  "fixture": "07_magic_gate",
+  "description": "Buffer overflow gated behind a magic UART byte (gate == 0xA5) -- the hard problem the generic fixed-pattern concrete driver ('A'-filled payload) cannot solve on its own. Requires the angr-based symbolic path-solve fallback (dvl.oracle_pathsolve) to synthesize an input satisfying the gate before the generic driver's Inconclusive verdict would otherwise be final.",
+  "cases": [
+    {
+      "binary": "bad.elf",
+      "function": "handle_command_gated",
+      "address": "0x134",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "expected_confidence": "medium",
+      "expected_engine_tier": "B_partial_dynamic",
+      "reason": "cmd[8] is written with no bound check on the loop index i, but only after gate == 0xA5. The generic 'A'-filled (0x41) payload never satisfies the gate, so the concrete driver alone reports Inconclusive; the angr path-solve fallback must synthesize a first byte of 0xA5 (plus enough following bytes) to actually drive execution into the vulnerable loop and trigger the overflow."
+    },
+    {
+      "binary": "good.elf",
+      "function": "handle_command_gated_safe",
+      "address": "0x13a",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "expected_confidence": "medium",
+      "expected_engine_tier": "B_partial_dynamic",
+      "reason": "Same magic-byte gate (still requires the path-solve fallback to reach at all), but the write index is bounds-checked (i <= 7) before every write. No OOB write occurs for any sequence of injected bytes."
+    }
+  ]
+}

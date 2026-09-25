@@ -1,0 +1,22 @@
+{
+  "fixture": "06_oob_read",
+  "description": "Out-of-bounds read: unchecked array index reads and transmits memory well past the end of an 8-byte buffer; safe twin bounds-checks the index first.",
+  "cases": [
+    {
+      "binary": "bad.elf",
+      "function": "print_nth",
+      "cwe": "CWE-125",
+      "expected_verdict": "TP",
+      "expected_confidence": "high",
+      "reason": "arr[n] is read with n=40 against an 8-byte buffer -- 32 bytes past the end. The read-side bounds oracle must observe a read at data+40, outside [data, data+8)."
+    },
+    {
+      "binary": "good.elf",
+      "function": "print_nth_safe",
+      "cwe": "CWE-125",
+      "expected_verdict": "FP",
+      "expected_confidence": "high",
+      "reason": "The index is checked against [0, len) before any dereference. For n=40, len=8, the function returns immediately and arr[n] is never read."
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "fixture": "01_stack_overflow",
+  "description": "Fixed 16-byte stack buffer overflowed by an unchecked mem_copy() of 64 bytes; safe twin clamps the copy length first.",
+  "cases": [
+    {
+      "binary": "bad.elf",
+      "function": "vulnerable_copy",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "expected_confidence": "high",
+      "reason": "mem_copy(buf, input, 64) writes 64 bytes into a 16-byte stack buffer. The bounds oracle must observe writes to buf+16..buf+63 (48 bytes out of bounds) during emulation from reset."
+    },
+    {
+      "binary": "good.elf",
+      "function": "safe_copy",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "expected_confidence": "high",
+      "reason": "Copy length is clamped to sizeof(buf)-1 before mem_copy() runs. Every write during emulation lands inside [buf, buf+16). No OOB access is ever observed."
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "fixture": "04_mmio_gated",
+  "description": "Buffer overflow gated behind a UART RXNE busy-poll -- the prompt's #1 named hard problem ('bare-metal code often blocks on register polls that will hang a naive emulator'). Both twins require the same MMIO poll-breaking to reach at all; only the bad twin lacks a bound check.",
+  "cases": [
+    {
+      "binary": "bad.elf",
+      "function": "handle_command",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "expected_confidence": "high",
+      "reason": "cmd[8] is written with no bound check on the loop index i. Feeding more than 8 bytes before a newline through the emulated UART0->DR overflows cmd. Requires the emulator's MMIO layer to (a) break the RXNE poll loop instead of hanging, and (b) actually vary the injected bytes -- a naive stub returning a constant would either hang forever or never trigger the overflow.",
+      "failure_modes_if_wrong": [
+        "Naive MMIO (always return 0 for SR): uart_getc() spins forever -> wrongly reported as hang/Inconclusive/unreachable.",
+        "MMIO that unblocks RXNE but always feeds the same byte or immediately '\\n': loop exits after 1 iteration -> bug never triggers, wrongly reported as FP."
+      ]
+    },
+    {
+      "binary": "good.elf",
+      "function": "handle_command_safe",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "expected_confidence": "high",
+      "reason": "Same MMIO poll-loop reachability requirement as bad.elf (this must still be reached, not short-circuited), but the write index is bounds-checked (i < sizeof(cmd)) before every write. No OOB write occurs for any sequence of injected bytes."
+    }
+  ]
+}

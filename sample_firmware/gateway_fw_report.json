@@ -1,0 +1,84 @@
+{
+  "success": true,
+  "sample_id": "gateway-fw-demo",
+  "filename": "gateway_fw.elf",
+  "architecture": {
+    "arch": "arm",
+    "file_type": "elf",
+    "bits": 32,
+    "endian": "little",
+    "method": "elf_header"
+  },
+  "findings": [
+    {
+      "cwe_id": "CWE_121",
+      "cwe_num": "121",
+      "cwe_name": "Stack-based Buffer Overflow",
+      "severity": "High",
+      "addresses": ["0x16a"],
+      "symbols": ["process_uart_command"],
+      "tids": ["finding_uart_cmd_overflow"],
+      "description": "Unbounded write into cmd_buf while parsing a UART command line.",
+      "ai_audit": {"confidence": 0.6}
+    },
+    {
+      "cwe_id": "CWE_121",
+      "cwe_num": "121",
+      "cwe_name": "Stack-based Buffer Overflow",
+      "severity": "Medium",
+      "addresses": ["0x1ac"],
+      "symbols": ["parse_header"],
+      "tids": ["finding_header_copy"],
+      "description": "Copy into fixed-size header buffer with an attacker-influenced length argument.",
+      "ai_audit": {"confidence": 0.4}
+    },
+    {
+      "cwe_id": "CWE_125",
+      "cwe_num": "125",
+      "cwe_name": "Out-of-bounds Read",
+      "severity": "High",
+      "addresses": ["0x1d8"],
+      "symbols": ["get_calibration"],
+      "tids": ["finding_calibration_oob_read"],
+      "description": "calibration_table indexed by an unchecked channel argument.",
+      "ai_audit": {"confidence": 0.55}
+    },
+    {
+      "cwe_id": "CWE_789",
+      "cwe_num": "789",
+      "cwe_name": "Memory Allocation with Excessive Size Value",
+      "severity": "Medium",
+      "addresses": ["0x1ee"],
+      "symbols": ["init_diagnostics_buffer"],
+      "tids": ["finding_diag_buffer_alloc"],
+      "description": "2056-byte stack allocation flagged by a fixed-size threshold check.",
+      "ai_audit": {"confidence": 0.3}
+    },
+    {
+      "cwe_id": "CWE_121",
+      "cwe_num": "121",
+      "cwe_name": "Stack-based Buffer Overflow",
+      "severity": "High",
+      "addresses": ["0x24e"],
+      "symbols": ["UART0_IRQHandler"],
+      "tids": ["finding_event_log_overflow"],
+      "description": "event_log written with no bound check on event_log_idx inside the UART0 interrupt handler.",
+      "ai_audit": {"confidence": 0.5}
+    },
+    {
+      "cwe_id": "CWE_121",
+      "cwe_num": "121",
+      "cwe_name": "Stack-based Buffer Overflow",
+      "severity": "High",
+      "addresses": ["0x2a4"],
+      "symbols": ["process_auth_command"],
+      "tids": ["finding_auth_buf_overflow"],
+      "description": "Unbounded write into auth_buf while parsing an authenticated command frame.",
+      "ai_audit": {"confidence": 0.45}
+    }
+  ],
+  "metrics": {
+    "total_findings_raw": 6,
+    "audited_findings": 6
+  }
+}

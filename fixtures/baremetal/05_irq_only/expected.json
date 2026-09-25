@@ -1,0 +1,19 @@
+{
+  "fixture": "05_irq_only",
+  "description": "Buffer overflow reachable ONLY through an interrupt handler (vector-table slot 16, IRQ0/UART0_IRQHandler) -- the prompt's 2nd named hard problem: reachability must consider 'any entry point (interrupt handlers included)'. main() never touches the vulnerable state.",
+  "cases": [
+    {
+      "binary": "bad.elf",
+      "function": "UART0_IRQHandler",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "expected_confidence": "high",
+      "reason": "irq_buf[8] is written at irq_buf_idx with no bound check. Each UART0 IRQ delivers one more byte; if more than 8 bytes arrive without a '\\n' resetting the index, the write overflows irq_buf. Reachability analysis must treat vector[16] (IRQ0) as a CFG root independent of main()'s call graph -- it is NOT reachable by walking calls from main/Reset_Handler alone.",
+      "verification_strategy": "Full NVIC/interrupt-controller emulation is out of scope for the MVP. Per the pipeline's step 4 ('seed emulation directly at the finding's entry point'), dynamic verification should seed the emulator at UART0_IRQHandler's address directly (treating it like a callable entry with its own stack frame) and drive it with >8 injected bytes across repeated invocations, rather than attempting to simulate real interrupt delivery/preemption from main()'s wfi loop.",
+      "failure_modes_if_wrong": [
+        "Reachability rooted only at main()/Reset_Handler: UART0_IRQHandler has no incoming call edge from main -> wrongly classified unreachable/FP.",
+        "Emulation that only ever runs from reset and never seeds/injects at the ISR: main() sits in 'wfi' forever, ISR body never executes -> wrongly reported Inconclusive."
+      ]
+    }
+  ]
+}
