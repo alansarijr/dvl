@@ -1,45 +1,29 @@
 """
-Symbolic path-driving fallback (prompt pipeline step 4, "solve for
-register/memory state at the finding's entry point").
+Symbolic path-driving fallback.
 
-`pipeline.py`'s generic concrete driver (a fixed-pattern UART payload)
-covers every *currently known* fixture shape, but by construction it can
-never reach a finding gated behind a *specific* input value (e.g.
-`if (cmd[0] == 0xA5) ...`) -- no amount of padding satisfies an equality
-check the driver doesn't know about. This module is invoked ONLY as a
-second-chance fallback when that concrete driver's result comes back
-Inconclusive: it uses angr to symbolically solve for a concrete UART byte
-sequence that reaches the flagged address, then hands that solved input
-back to the caller so it can be replayed through the same
-`emulator_cortexm.CortexM3Harness` + `oracle_bounds` used everywhere else
-in this pipeline. angr never performs the trigger-verification step
-itself -- it only synthesizes an input. This keeps the actual
-memory-safety verdict resting on the same proven concrete Unicorn trace
-as every other finding.
+The generic concrete driver (a fixed UART payload) can never reach code
+behind a check for a specific value, e.g. `if (cmd[0] == 0xA5)`. When the
+flagged instruction never executed, this module uses angr to solve for a
+UART byte prefix and r0-r3 arguments that reach it from the flagged
+function's entry. The caller replays the result in the Unicorn harness
+and runs the usual oracles on that trace; angr only produces the input.
 
-Deliberately scoped to reset-vector-rooted (non-IRQ) findings only. The
-IRQ-only driving strategy (repeated ISR re-entry, one queued byte per
-simulated interrupt) doesn't map onto a single continuous symbolic run in
-any straightforward way, and none of the hard problems this MVP targets
-need it -- see pipeline.py's is_irq_only() branch, which never calls
-into this module.
+Not used for IRQ-only findings: repeated interrupt delivery does not map
+onto one continuous symbolic run.
 
-Anti-explosion design: the UART status register (SR) is concrete, and
-only the first few data-register (DR) bytes are symbolic. The UART model
-here matches what the Unicorn replay will see: RXNE is set while bytes
-remain in `prefix + filler + '\n'`, the filler is 'A', and nothing
-arrives after that. All UART state lives in state.globals so each angr
-state (each branch) counts its own reads.
-
-r0-r3 are explicit symbols because the search starts at the flagged
-function's entry with its arguments unknown; the solved values are
-returned so the replay uses the same arguments. All other registers and
-memory are zero-filled, like the Unicorn harness's fresh RAM.
+Keeping the search small: the UART status register is concrete and only
+the first few data-register bytes are symbolic. The UART model matches
+what the replay will see: RXNE is set while bytes remain in
+`prefix + filler + '\n'`, the filler is 'A', and nothing arrives after
+that. UART state lives in state.globals so each branch counts its own
+reads. Registers other than r0-r3, and memory, are zero-filled like the
+harness's fresh RAM.
 """
 from __future__ import annotations
 
+import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from .elfinfo import ElfGroundTruth
@@ -93,6 +77,8 @@ def solve_driving_input(gt: ElfGroundTruth, profile: TargetProfile, root_addr: i
         import claripy
     except ImportError:
         return None
+    for noisy in ("angr", "cle", "pyvex", "claripy"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
 
     try:
         project = gt.cache.get("angr_project")

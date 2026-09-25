@@ -1,6 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dvl"
+dynamic = ["version"]
+description = "Dynamic verification layer: adjudicates bare-metal SAST findings as TP / FP / Inconclusive"
+readme = "README.md"
+requires-python = ">=3.11"   # tomllib
+# Pinned to the versions the test suite runs against. angr in particular
+# changes APIs between releases.
+dependencies = [
+    "pyelftools==0.33",
+    "capstone==5.0.9",
+    "unicorn==2.1.4",
+]
+
+[project.optional-dependencies]
+# Symbolic path-solve fallback; without it those findings stay Inconclusive.
+angr = ["angr==9.3.2"]
+dev = ["angr==9.3.2", "pytest>=8", "pyflakes"]
+
+[project.scripts]
+dvl = "dvl.cli:main"
+
+[tool.setuptools]
+packages = ["dvl"]
+
+[tool.setuptools.dynamic]
+version = { attr = "dvl.__version__" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
-    "slow: runs the angr path-solve fallback or a whole sample report (minutes)",
+    "slow: runs the angr path-solve fallback or a whole sample report",
 ]

@@ -1,4 +1,5 @@
-pyelftools
-capstone
-unicorn
-angr
+# Same pins as pyproject.toml, for `pip install -r`.
+pyelftools==0.33
+capstone==5.0.9
+unicorn==2.1.4
+angr==9.3.2

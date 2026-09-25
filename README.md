@@ -1,136 +1,163 @@
 # Dynamic Verification Layer (DVL) for Bare-Metal SAST Findings
 
-A dynamic verification layer that sits downstream of a bare-metal SAST
-pipeline (r2pipe + cwe_checker) and adjudicates each static finding as
-**TP**, **FP**, or **Inconclusive** by re-deriving ground truth from the
-binary and, where possible, emulating the firmware to actually reach and
-trigger the flagged code path.
+DVL sits downstream of a bare-metal SAST pipeline (r2pipe + cwe_checker)
+and adjudicates each finding as **TP**, **FP** or **Inconclusive**. It
+re-derives ground truth from the binary (ARM/Thumb mode, function
+boundaries, buffer sizes) instead of trusting the upstream tool. Where it
+can, it emulates the firmware to reach the flagged code and trigger the bug.
 
-Target tier implemented: **ARM Cortex-M3, bare-metal** (full dynamic
-verification via Unicorn). Any other target/arch falls through to
-static-only refutation (`EngineTier.C_STATIC_ONLY`) rather than guessing.
+Full dynamic verification targets **ARM Cortex-M** (Unicorn). Other images
+get static checks only (reachability, CWE-789) and are otherwise reported as
+Inconclusive with the reason.
+
+## Running
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'   # angr is large
+
+# Converted pipeline report or raw `cwe_checker --json` output
+.venv/bin/dvl firmware.elf findings.json --json report.json
+.venv/bin/dvl firmware.elf findings.json --target targets/my-board.toml
+.venv/bin/dvl firmware.elf findings.json --svd STM32F103.svd --svd-uart USART1
+
+# Tests: every fixture goes through the same pipeline as the CLI
+make -C fixtures/baremetal all
+.venv/bin/pytest                 # ~5 s
+.venv/bin/pytest -m "not slow"   # skips angr and whole-sample runs
+```
+
+`main.py` runs the same CLI from a checkout without installing. angr is
+optional (`pip install -e '.[angr]'`): without it, findings that need an
+input-solving step stay Inconclusive.
+
+## How a finding is decided
+
+1. **Static reachability** (`callgraph.py`, `oracle_reachability.py`),
+   for any image and CWE. The entry points are the reset handler, every
+   vector-table slot, and every function whose address is taken (found in
+   data words, literal pools, `movw/movt`, `adr`). Unreachable functions,
+   and code no path inside a live function reaches, are FP. Confidence is
+   *medium* when reachable code has indirect branches.
+2. **CWE-789** (`oracle_allocsize.py`): the flagged instruction is
+   re-disassembled in the mode given by the ELF's mapping symbols.
+   - `sub sp, sp, #N` with N above the profile threshold (7500 by
+     default, as in cwe_checker) is TP (*medium*).
+   - At or below the threshold it is FP.
+   - A register-sized allocation, or an instruction that allocates
+     nothing, is Inconclusive.
+3. **CWE-121/125/787**, when the target profile allows emulation. The
+   firmware runs in Unicorn (`emulator_cortexm.py`) with a shadow call
+   stack, and two oracles check the trace:
+   - `oracle_bounds.py` (needs DWARF): an access made while the flagged
+     function is live that lands outside every live object, or that runs
+     contiguously from one object into the next.
+   - `oracle_retaddr.py` (for CWE-121/787; no DWARF needed): a write to a
+     live frame's saved return address. It can confirm a smash, never
+     clear one.
+
+   Driving the firmware:
+   - Findings reachable only through the vector table: run reset until
+     the firmware idles, then deliver interrupts.
+   - Everything else: run from reset with a generic UART payload.
+   - If the flagged instruction never runs and the run read no input,
+     that run is the program's only behavior, so the finding is FP.
+     Otherwise `oracle_pathsolve.py` (angr) solves for bytes and arguments
+     from the function's entry, and the replay is judged the same way
+     (*medium*).
+
+The emulator keeps going past one bug to reach the next:
+- A return through a smashed LR is repaired (callee-saved registers, SP
+  and PC restored from the frame's entry).
+- A guard region above RAM records accesses that would bus-fault
+  instead of ending the run.
+
+Both are noted in the evidence.
+
+## Target profiles
+
+`targets/*.toml` describes a board: memory regions, vector table,
+peripherals, the UART used for input, optional test-harness exit register,
+and limits (instruction budget, CWE-789 threshold). **Every field is
+optional.** Omitted fields are derived from the ELF:
+- the vector table, from `.isr_vector`, known symbols, or the
+  SP/reset-handler shape
+- the initial SP
+- flash and RAM, along the architectural Cortex-M map
+- generic MMIO over the peripheral region and the PPB
+
+`svd = "device.svd"` maps every SVD peripheral and takes the UART's
+register layout from it. `targets/dvl-fixtures.toml` is the synthetic
+board the fixtures use; `fixtures/baremetal/12_stm32_layout/target.toml`
+shows a profile that only names an SVD.
+
+## Evidence
+
+Every dynamic verdict records:
+- **the input**: channel, bytes, how many were consumed, generic or angr,
+  and how the run was entered
+- **for a violation**: the call path, the violating access with the 16
+  before it (PC, function, source line), and the registers at that access,
+  captured by replaying the run deterministically
+
+Reachability FPs list the entry points, address-taken functions and
+indirect branch sites considered.
 
 ## Layout
 
 ```
 dvl/
-  schema.py              normalized Finding / VerdictRecord / Evidence / EngineTier
-  elfinfo.py              ELF/DWARF ground truth: functions, ARM/Thumb mode
-                          (via mapping symbols, NOT trusted from upstream),
-                          DWARF locals/globals (fbreg / addr resolution)
-  callgraph.py            static call-graph builder + vector-table roots
-  mmio.py                 UART0/SIM peripheral model + poll-breaker
-  emulator_cortexm.py     Unicorn-based Cortex-M3 harness (memory map,
-                          frame-base tracking, access-trace collection)
-  oracle_reachability.py  CWE-agnostic static reachability pre-filter
-  oracle_bounds.py        CWE-121/125/787 trigger-verification oracle
-  oracle_allocsize.py     CWE-789 oracle (constant-immediate proof +
-                          instruction re-validation)
-  oracle_pathsolve.py     angr-based symbolic path-solve fallback (only
-                          when the generic concrete driver can't reach a
-                          magic-value-gated finding) -- see below
-  ingest.py               parses cwe_checker-style SAST report JSON
-  pipeline.py             ties ingest -> capability detection -> oracle
-  report.py               JSON + human-readable output
-
-fixtures/baremetal/       7 bad/good ELF fixture pairs + expected.json
-                          ground truth, covering every "hard problem"
-                          named in the brief (see below)
-tests/                    pytest suite: every fixture case goes through
-                          pipeline.adjudicate, plus end-to-end sample runs
-main.py                   CLI: run the pipeline against a real SAST report
+  cli.py                 command line (installed as `dvl`)
+  ingest.py              converted report or raw cwe_checker JSON -> Finding
+  elfinfo.py             ELF/DWARF ground truth: functions, ARM/Thumb mode from
+                         mapping symbols, DWARF locals/globals (incl. location
+                         lists), line table
+  target.py, svd.py      target profiles, ELF-derived defaults, SVD import
+  callgraph.py           capstone call graph, address-taken roots, vector table,
+                         intra-function reachability
+  mmio.py                UART / exit-register models, generic poll-breaker
+  emulator_cortexm.py    Unicorn harness: shadow call stack, access trace,
+                         idle/starvation stops, IRQ delivery, hijack recovery
+  oracle_*.py            reachability, bounds, return address, alloc size, angr
+  pipeline.py            orchestration and evidence
+  report.py, schema.py   output
+fixtures/baremetal/      bad/good ELF pairs + expected.json per hard problem
+targets/                 target profiles
+tests/                   pytest suite
+docs/Init_prompt.md      the original brief
 ```
 
-## Running
+## Fixtures
 
-```bash
-# Set up the venv (angr is a heavy dependency -- kept out of system Python)
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+Each `expected.json` names the flagged line (`"line": "bad.c:34"`,
+resolved through the DWARF line table so rebuilds don't break it) and the
+expected verdict. Every case goes through `pipeline.adjudicate`.
 
-.venv/bin/pip install pytest
+| # | Scenario | What it exercises |
+|---|----------|-------------------|
+| 01 | Stack overflow via `mem_copy` | Baseline bounds oracle |
+| 02 | Constant 4 KiB / 16 KiB frames | CWE-789 threshold, both sides |
+| 03 | Overflow in an uncalled function; dead code in a live one | Reachability from all roots; intra-function walk |
+| 04 | Overflow behind a UART `RXNE` poll | MMIO modeling |
+| 05 | Overflow reachable only from an IRQ handler | Vector-table roots; IRQ delivery after reset |
+| 06 | Out-of-bounds read | Read-side oracle; epilogue `pop` is not a read of a variable |
+| 07 | Overflow behind a magic UART byte | angr path-solve fallback |
+| 08 | Handler called only through a function pointer | Address-taken roots |
+| 09 | Caller reuses a returned callee's stack | Frame liveness |
+| 10 | Fixture 04 at `-O2` / `-Os` | DWARF location lists |
+| 11 | Fixture 01 with debug info stripped | Return-address oracle without DWARF |
+| 12 | Fixtures 01/04 on an STM32-like layout | ELF-derived memory map, SVD UART |
 
-# Rebuild all fixtures from source and validate the pipeline against them
-make -C fixtures/baremetal all
-.venv/bin/pytest                 # everything (~2 min, angr cases included)
-.venv/bin/pytest -m "not slow"   # skips angr and whole-sample runs
+## Known limitations
 
-# Run the full pipeline against the real-world sample
-.venv/bin/python3 main.py "Firmware Samples/row_413_bad.arm.elf" "Firmware Samples/result.json" --json /tmp/report.json
-```
-
-angr is optional at runtime: if it isn't installed, `pipeline.py` simply
-skips the symbolic path-solve fallback (see below) and falls back to its
-prior Inconclusive-with-a-note behavior -- so `main.py`/`run_fixtures.py`
-also work fine under plain system `python3` for anything that doesn't
-need fixture 07's magic-gate case.
-
-## Fixtures -- one per named "hard problem"
-
-| # | Scenario | Hard problem exercised |
-|---|----------|-------------------------|
-| 01 | Stack buffer overflow (write) | Baseline TP/FP bounds-oracle correctness |
-| 02 | Large (4096B) but constant-immediate `sub sp` | CWE-789 false-positive-by-threshold; provenance of the size operand |
-| 03 | Real overflow in dead code | Static reachability filter must root at ALL entry points, not just `main()` |
-| 04 | Overflow gated behind a UART `RXNE` busy-poll | "Peripheral/MMIO stubbing... biggest source of emulation hangs/false unreachability" |
-| 05 | Overflow reachable ONLY via an interrupt handler | Reachability rooted at every vector-table slot, not just call-graph from `main()` |
-| 06 | Out-of-bounds *read* | Read-side (not just write-side) oracle correctness |
-| 07 | Overflow gated behind a magic UART byte (`gate == 0xA5`) | The generic fixed-pattern concrete driver can never satisfy an equality gate on its own -- requires the angr symbolic path-solve fallback (`oracle_pathsolve.py`) |
-
-All 11 cases (bad+good twins where applicable) pass against
-`expected.json` ground truth after a clean rebuild.
-
-## Symbolic path-solve fallback (angr)
-
-`pipeline.py`'s generic dynamic driver reaches every finding whose
-trigger just needs "enough" input (buffer overflows via long-enough
-padding), but by construction can never satisfy a finding gated behind a
-*specific* value it doesn't know about, e.g. `if (cmd[0] == 0xA5) ...`.
-When the concrete driver's result comes back with no relevant memory
-access observed at all (the code path plausibly wasn't exercised, not
-"verified safe"), `oracle_pathsolve.py` uses angr to symbolically solve
-for a short input prefix (default 4 bytes) that gets past the gate, then
-appends a generic 'A'-filled/newline-terminated suffix -- identical in
-spirit to the plain concrete driver's own payload -- so a real loop-based
-overflow still has room to actually happen once replayed. That solved
-input is replayed through the same Unicorn harness + `oracle_bounds`
-used everywhere else; angr never performs trigger verification itself,
-it only synthesizes an input. Findings resolved this way are tagged
-`EngineTier.B_partial_dynamic` / `confidence: medium` (lower than the
-generic driver's `high`, since input-synthesis leans on angr's own,
-separately-modeled MMIO stubbing) and carry `evidence_kind: "pathsolve"`
-in the JSON report.
-
-Scoped to reset-vector-rooted (non-IRQ) findings only, and the UART
-status register is kept concrete (same poll-break-after-N-reads rule as
-the Unicorn harness) rather than symbolic, specifically to avoid the
-MMIO-symbolic-explosion trap called out in the Known Hard Problems below
--- only the small solved prefix is ever left as a genuine unknown for the
-solver.
-
-## Real-world sample result
-
-`Firmware Samples/row_413_bad.arm.elf` does not match the bare-metal
-Cortex-M vector-table memory layout the emulation harness targets (it's
-a much larger image with a different entry/load layout), so the pipeline
-correctly falls back to **static-only refutation** for its two CWE-789
-findings. Independently re-disassembling the flagged addresses (using
-our own ELF-mapping-symbol-derived ARM/Thumb mode, not the upstream
-tool's) reveals they *are* genuine `sub sp, sp, #imm` allocation
-instructions with literal immediate sizes (8 and 92 bytes) -- proving
-both are compile-time constants and refuting CWE-789 with high
-confidence, resolving the upstream AI-audit's own "UNCERTAIN / LOW
-confidence" verdict with concrete evidence.
-
-## Known limitations (by design, for this MVP)
-
-- Single-arch depth (ARM Cortex-M3 Thumb); AVR/MIPS32 were evaluated and
-  ruled out for this pass (tooling support gaps in Unicorn/capstone/angr
-  for AVR in particular).
-- Symbolic execution (angr) is scoped narrowly to a path-solve fallback
-  for reset-vector-rooted findings the generic concrete driver can't
-  reach (see above) -- it is not a general symbolic-execution engine,
-  does not run for IRQ-only findings, and only leaves a small input
-  prefix symbolic (everything else, including the UART status register,
-  stays concrete) to keep it fast and bounded.
-- `oracle_allocsize`'s register-operand (non-immediate) case is flagged
-  Inconclusive rather than resolved via real taint analysis.
+- Cortex-M (Thumb) only for dynamic verification.
+- The input channel is one UART. Other peripherals only get the generic
+  poll-breaker, so logic that depends on real peripheral behavior may not
+  be reached.
+- Binaries with no symbol table at all are out of scope: function
+  boundaries would need recovery first.
+- An FP from a run that reached the flagged code means "no violation with
+  the inputs tried", not a proof for all inputs. An FP from the angr path
+  rests on one solved input.
+- The bounds oracle attributes an access to the nearest object below it.
+  A bug in a callee that corrupts a global while the flagged function is
+  live is attributed to the flagged finding.

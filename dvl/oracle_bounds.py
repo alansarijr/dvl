@@ -25,7 +25,7 @@ reads the saved registers just above the locals.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from capstone import arm_const as A

@@ -4,3 +4,5 @@ __pycache__/
 *.map
 *.lst
 *.o
+*.egg-info/
+build/
