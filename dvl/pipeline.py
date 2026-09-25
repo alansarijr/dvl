@@ -46,7 +46,7 @@ from __future__ import annotations
 from typing import Optional
 
 from . import elfinfo, oracle_allocsize, oracle_reachability, oracle_bounds, oracle_pathsolve
-from .emulator_cortexm import CortexM3Harness, RAM_BASE, RAM_SIZE
+from .emulator_cortexm import CortexM3Harness
 from .schema import Finding, Verdict, VerdictRecord, Evidence, EngineTier
 
 GENERIC_ISR_PAYLOAD = bytes([ord('A')] * 16)              # no '\n' -> any index-reset logic never fires
@@ -71,165 +71,95 @@ def _looks_like_cortexm_fixture_target(gt: elfinfo.ElfGroundTruth) -> bool:
     return plausible_sp and matches_entry
 
 
-def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, func) -> VerdictRecord:
-    entry_addrs = {f.address for f in gt.functions}
-    irq_only = oracle_reachability.is_irq_only(gt, finding.address)
-
+def _drive(gt: elfinfo.ElfGroundTruth, finding: Finding, func, irq_only: bool):
+    """Runs the generic concrete driver. Returns (run_result, description)."""
     harness = CortexM3Harness(gt)
+    harness.watch(finding.address)
+    harness.set_instruction_budget(GENERIC_INSTRUCTION_BUDGET)
     if irq_only:
-        isr_sp = RAM_BASE + RAM_SIZE - 0x400
+        # Let reset and main() set up whatever state the handler relies on,
+        # then deliver one interrupt per queued UART byte from that idle
+        # point, as the NVIC would.
+        boot = harness.run_from(gt.entry, stop_at_idle=True)
         harness.set_input_queue(GENERIC_ISR_PAYLOAD)
-        run_result = None
+        run_result = boot
         for _ in range(len(GENERIC_ISR_PAYLOAD)):
-            run_result = harness.run_from(func.address, sp=isr_sp)
-        driver_desc = (f"ISR-seeded driver: '{func.name}' is reachable only via the "
-                        f"vector table (no path from the reset vector's own call "
-                        f"graph), so execution was seeded directly at its entry "
-                        f"point 0x{func.address:x}, {len(GENERIC_ISR_PAYLOAD)} times "
-                        f"-- once per simulated interrupt -- each consuming one "
-                        f"queued UART byte.")
+            run_result = harness.deliver_irq(func.address)
+        desc = (f"IRQ driver: '{func.name}' is reachable only via the vector table, so the "
+                f"firmware ran from reset until it went idle ({boot.stopped_reason}) and "
+                f"{len(GENERIC_ISR_PAYLOAD)} interrupts were then delivered to it, each with "
+                f"one queued UART byte.")
     else:
-        harness.set_instruction_budget(GENERIC_INSTRUCTION_BUDGET)
         harness.set_input_queue(GENERIC_RESET_PAYLOAD)
-        run_result = harness.run_from(gt.entry)
-        driver_desc = (f"Reset-vector driver: ran from the reset vector with a "
-                        f"generic {len(GENERIC_RESET_PAYLOAD)}-byte UART payload "
-                        f"preloaded (covers both input baked directly into a call "
-                        f"site and input fed through the UART RX MMIO queue).")
+        run_result = harness.run_from(gt.entry, stop_at_idle=True)
+        desc = (f"Reset driver: ran from the reset handler with a generic "
+                f"{len(GENERIC_RESET_PAYLOAD)}-byte UART payload preloaded "
+                f"(stopped: {run_result.stopped_reason}).")
+    return run_result, desc
 
-    candidates = []   # list[(var, owning_function, sibling_vars_or_None)]
-    local_vars = gt.variables_for(func)
-    global_vars = list(gt.global_variables.values())
-    for v in local_vars:
-        candidates.append((v, func, local_vars))
-    for v in global_vars:
-        # Sibling set includes other globals (so a global laid out right
-        # next to `v` in .bss/.data isn't misattributed as `v` overflowing
-        # -- see oracle_bounds._contained_in_sibling) but deliberately NOT
-        # local_vars: locals live in a different function's stack frame
-        # entirely, never adjacent to a global in any meaningful sense.
-        candidates.append((v, func, global_vars))
 
-    if not candidates:
-        return VerdictRecord(
-            finding_id=finding.finding_id,
-            verdict=Verdict.INCONCLUSIVE,
-            confidence="low",
-            engine_tier=EngineTier.A_FULL_DYNAMIC,
-            evidence=Evidence(kind="bounds",
-                               detail=f"[{driver_desc}] No DWARF local or global variables "
-                                      f"were found to check bounds against for '{func.name}'."),
-            notes="Needs manual review or richer debug info -- DWARF has no candidate "
-                  "variable to anchor a bounds check against.",
-        )
+def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, func) -> VerdictRecord:
+    irq_only = oracle_reachability.is_irq_only(gt, finding.address)
+    run_result, driver_desc = _drive(gt, finding, func, irq_only)
+    res = oracle_bounds.check(gt, finding.cwe_id, func, run_result)
+    exercised = run_result.watch_hits.get(finding.address, 0) > 0
 
-    def _best_bounds_result(result):
-        """Returns (best, access_gap). access_gap is True iff at least one
-        of the flagged function's OWN LOCAL variables was cleared as FP
-        with ZERO observed accesses -- meaning the driver merely
-        returned/branched away before ever exercising that variable's
-        code (e.g. a magic-value gate it never satisfied), not that it
-        was verified safe. Deliberately scoped to locals only: a global
-        candidate (added to the pool so cross-function cases like a
-        shared lookup table still resolve) showing no access is entirely
-        normal -- most of a real program's globals are unrelated to any
-        one given function -- and must NOT be treated as a gap, or every
-        FP in a multi-global program would look suspicious. A single
-        unrelated always-touched local clearing cleanly must not paper
-        over a genuine gap in another local, which is why this checks
-        every local candidate rather than trusting whichever one 'best'
-        happens to land on."""
-        best = None
-        access_gap = False
-        for var, owning, siblings in candidates:
-            res = oracle_bounds.check(finding.cwe_id, var, owning, result,
-                                        all_function_vars=siblings,
-                                        function_entry_addrs=entry_addrs)
-            if res.verdict == Verdict.FP and not res.saw_any_access and not var.is_global:
-                access_gap = True
-            if res.verdict == Verdict.TP:
-                return res, access_gap
-            if best is None or (best.verdict == Verdict.INCONCLUSIVE and res.verdict == Verdict.FP):
-                best = res
-        return best, access_gap
+    def record(verdict, confidence, detail, notes="", tier=EngineTier.A_FULL_DYNAMIC, kind="bounds"):
+        return VerdictRecord(finding_id=finding.finding_id, verdict=verdict, confidence=confidence,
+                             engine_tier=tier, evidence=Evidence(kind=kind, detail=detail), notes=notes)
 
-    best, access_gap = _best_bounds_result(run_result)
+    if res.verdict == Verdict.TP:
+        return record(Verdict.TP, "high", f"[{driver_desc}] {res.detail}")
 
-    if (best.verdict == Verdict.INCONCLUSIVE or access_gap) and not irq_only:
-        # The generic fixed-pattern payload never reached/triggered the
-        # finding -- try solving for a specific driving input before
-        # giving up. See dvl.oracle_pathsolve for why this is scoped to
-        # non-IRQ findings and how it avoids the MMIO-symbolic-explosion
-        # trap.
-        #
-        # Seeded at the flagged function's OWN entry point, not the reset
-        # vector -- same rationale as the IRQ-seeded strategy above. A
-        # real firmware's main() typically calls several UART-consuming
-        # functions before the flagged one; solving/replaying from the
-        # reset vector would burn the solved prefix (and the replayed
-        # bytes) on those earlier, unrelated reads before ever reaching
-        # this function's own gate check.
+    if res.objects_known == 0 and exercised:
+        return record(Verdict.INCONCLUSIVE, "low",
+                      f"[{driver_desc}] The flagged instruction executed, but there are no "
+                      f"DWARF-described objects to check its accesses against.",
+                      notes="Needs debug info (DWARF locals/globals) or manual review.")
+
+    if exercised:
+        return record(Verdict.FP, "high", f"[{driver_desc}] Flagged instruction executed "
+                                          f"{run_result.watch_hits[finding.address]} time(s). {res.detail}")
+
+    if run_result.deterministic and not irq_only:
+        return record(Verdict.FP, "high",
+                      f"[{driver_desc}] The flagged instruction never executed, and the run read "
+                      f"no input and ran to completion ({run_result.stopped_reason}), so this is the "
+                      f"program's only behavior: the flagged code cannot run.")
+
+    if not irq_only:
+        # The generic payload never reached the flagged instruction; solve
+        # for an input that does. Seeded at the flagged function's own
+        # entry, so earlier UART consumers in main() cannot eat the solved
+        # bytes before its gate check.
         solved = oracle_pathsolve.solve_driving_input(gt, func.address, finding.address)
         if solved is not None:
-            solved_harness = CortexM3Harness(gt)
-            solved_harness.set_instruction_budget(GENERIC_INSTRUCTION_BUDGET)
-            solved_harness.set_input_queue(solved.uart_bytes)
-            solved_result = solved_harness.run_from(func.address)
-            solved_best, solved_access_gap = _best_bounds_result(solved_result)
-            if solved_best is not None and (
-                    solved_best.verdict == Verdict.TP or
-                    (solved_best.verdict == Verdict.FP and not solved_access_gap)):
-                return VerdictRecord(
-                    finding_id=finding.finding_id,
-                    verdict=solved_best.verdict,
-                    confidence="medium",
-                    engine_tier=EngineTier.B_PARTIAL_DYNAMIC,
-                    evidence=Evidence(kind="pathsolve",
-                                       detail=f"[{solved.detail}] {solved_best.detail}"),
-                    notes="Confirmed via a symbolically-solved driving input, not the "
-                          "generic fixed-pattern payload -- medium rather than high "
-                          "confidence because the input-synthesis step relies on angr's "
-                          "own (separately modeled) MMIO stubbing rather than the "
-                          "Unicorn harness's, even though the final trigger check ran "
-                          "on the real Unicorn trace.",
-                )
+            harness = CortexM3Harness(gt)
+            harness.watch(finding.address)
+            harness.set_instruction_budget(GENERIC_INSTRUCTION_BUDGET)
+            harness.set_input_queue(solved.uart_bytes)
+            replay = harness.run_from(func.address, r0=solved.args[0], r1=solved.args[1],
+                                      r2=solved.args[2], r3=solved.args[3])
+            replay_res = oracle_bounds.check(gt, finding.cwe_id, func, replay)
+            replay_hit = replay.watch_hits.get(finding.address, 0) > 0
+            notes = ("Driven by an angr-solved input from the flagged function's own entry, "
+                     "not from reset: this shows the bug can be triggered once that function "
+                     "runs with these arguments and bytes, not that reset leads there with them. "
+                     "Medium confidence for that reason.")
+            if replay_res.verdict == Verdict.TP:
+                return record(Verdict.TP, "medium", f"[{solved.detail}] {replay_res.detail}",
+                              notes=notes, tier=EngineTier.B_PARTIAL_DYNAMIC, kind="pathsolve")
+            if replay_hit and replay_res.objects_known:
+                return record(Verdict.FP, "medium", f"[{solved.detail}] {replay_res.detail}",
+                              notes=notes, tier=EngineTier.B_PARTIAL_DYNAMIC, kind="pathsolve")
 
-    final_verdict = best.verdict
-    confidence = "high" if final_verdict != Verdict.INCONCLUSIVE else "low"
-    notes = ""
-    if final_verdict == Verdict.INCONCLUSIVE:
-        notes = ("Emulation ran to completion but no candidate variable's window "
-                 "could be resolved conclusively with this generic driving "
-                 "strategy, and a symbolic path-solve fallback (dvl.oracle_pathsolve) "
-                 "either found no satisfying input within budget or is unavailable "
-                 "(angr not installed). Flagging for manual review or a "
-                 "scenario-specific driver.")
-    elif final_verdict == Verdict.FP and access_gap:
-        # best.verdict is FP, but at least one candidate cleared with ZERO
-        # observed accesses -- the driver (and, if attempted, the
-        # path-solve fallback) never actually drove into that candidate's
-        # code, so this is not a verified-safe FP. Report it honestly
-        # rather than letting "no access" quietly masquerade as "checked
-        # and fine". Deliberately does NOT touch a TP verdict here -- a
-        # confirmed out-of-bounds access on ONE candidate is real evidence
-        # regardless of what any OTHER, unrelated candidate variable saw.
-        final_verdict = Verdict.INCONCLUSIVE
-        confidence = "low"
-        notes = ("The driving input(s) tried (generic payload" +
-                 (", plus an angr-solved input," if not irq_only else "") +
-                 ") never caused any access to the candidate variable(s) at all -- "
-                 "the flagged code path was not actually exercised, so this cannot "
-                 "be reported as a confirmed FP. Needs a more targeted driver or "
-                 "manual review.")
-
-    return VerdictRecord(
-        finding_id=finding.finding_id,
-        verdict=final_verdict,
-        confidence=confidence,
-        engine_tier=EngineTier.A_FULL_DYNAMIC,
-        evidence=Evidence(kind="bounds", detail=f"[{driver_desc}] {best.detail}"),
-        notes=notes,
-    )
+    return record(Verdict.INCONCLUSIVE, "low",
+                  f"[{driver_desc}] The flagged instruction at 0x{finding.address:x} never executed "
+                  f"({run_result.stopped_reason}; {run_result.input_consumed} input byte(s) consumed).",
+                  notes=("The driving input(s) tried never reached the flagged code"
+                         + ("" if irq_only else ", and the angr path-solve fallback found no input "
+                            "that does (or angr is unavailable)")
+                         + ". Needs a more targeted driver or manual review."))
 
 
 def adjudicate(gt: elfinfo.ElfGroundTruth, finding: Finding) -> VerdictRecord:

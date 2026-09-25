@@ -43,6 +43,7 @@ UART_SR_TXE = 1 << 0
 UART_SR_RXNE = 1 << 1
 
 GENERIC_POLL_BREAK_THRESHOLD = 8   # reads of an unmodeled address before we force a bit
+INPUT_STARVED_THRESHOLD = 2000     # UART SR polls with an empty RX queue before the run is stopped
 
 
 @dataclass
@@ -57,6 +58,7 @@ class MmioModel:
     read_counts: dict = field(default_factory=dict)     # generic-fallback poll counters
     sr_read_count_since_last_rx: int = 0
     poll_break_log: list = field(default_factory=list)   # audit trail of poll-breaks applied
+    starved: bool = False    # firmware is spinning on RXNE and the input queue is empty
 
     def load_input(self, data: bytes):
         self.input_queue = bytearray(data)
@@ -71,6 +73,8 @@ class MmioModel:
             rxne = UART_SR_RXNE if self.rx_available() else 0
             if not self.rx_available():
                 self.sr_read_count_since_last_rx += 1
+                if self.sr_read_count_since_last_rx >= INPUT_STARVED_THRESHOLD:
+                    self.starved = True
             return txe | rxne
 
         if offset == UART0_DR:
@@ -114,9 +118,17 @@ def install(uc, model: MmioModel):
     region."""
 
     def read_cb(uc_, offset, size, user_data):
-        return model.read(offset, size)
+        value = model.read(offset, size)
+        if model.starved:
+            # Waiting forever for input that will never come.
+            uc_.emu_stop()
+        return value
 
     def write_cb(uc_, offset, size, value, user_data):
         model.write(offset, size, value)
+        if offset == SIM_EXIT:
+            # sim_exit() spins after the write; without stopping here every
+            # "exited" run burns the rest of the instruction budget.
+            uc_.emu_stop()
 
     uc.mmio_map(PERIPH_BASE, PERIPH_SIZE, read_cb, None, write_cb, None)

@@ -310,6 +310,30 @@ def build_callgraph(gt: ElfGroundTruth) -> CallGraph:
     return cg
 
 
+def idle_addresses(gt: ElfGroundTruth) -> frozenset:
+    """Addresses of wfi/wfe and branch-to-self instructions: the points where
+    firmware waits for an interrupt and nothing further happens without one."""
+    cached = gt.cache.get("idle")
+    if cached is not None:
+        return cached
+    idle = set()
+    for func in gt.functions:
+        if func.size <= 0:
+            continue
+        for lo, hi, mode in code_regions(gt, func.address, func.end):
+            if mode not in _MD:
+                continue
+            for insn in _MD[mode].disasm(gt.read_bytes(lo, hi - lo) or b"", lo):
+                if insn.id in (A.ARM_INS_WFI, A.ARM_INS_WFE):
+                    idle.add(insn.address)
+                elif insn.id == A.ARM_INS_B and insn.cc in (A.ARM_CC_AL, A.ARM_CC_INVALID) \
+                        and branch_target(insn) == insn.address:
+                    idle.add(insn.address)
+    result = frozenset(idle)
+    gt.cache["idle"] = result
+    return result
+
+
 # -- intra-procedural reachability ---------------------------------------------------
 
 @dataclass

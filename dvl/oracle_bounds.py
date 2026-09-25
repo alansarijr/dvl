@@ -1,274 +1,184 @@
 """
-CWE-121/787/125 trigger-verification oracle (prompt pipeline step 5).
+CWE-121/787/125 trigger-verification oracle.
 
-"apply a CWE-specific oracle ... check if the resulting write/read is
-out-of-bounds relative to the buffer's actual allocated size at that
-point in emulated memory, not just what the static analyzer inferred."
+Checks the emulator's access trace against the buffers DWARF says exist,
+at the addresses they actually had during the run, rather than the bound
+the SAST tool guessed.
 
-We use DWARF-recovered variable windows (dvl.elfinfo.VariableInfo) --
-the *actual* allocated size at that point in memory -- rather than
-whatever bound the SAST tool guessed, and check every memory access
-Unicorn observed during emulation against that window.
+Only accesses made while the flagged function's frame is live count: by
+the function itself or by a callee such as mem_copy. Accesses after it
+returns, or by unrelated code, cannot be evidence about this finding.
+
+A live access is out of bounds when either:
+
+  1. it lands outside every live object (the gaps between variables,
+     saved registers, padding, beyond the frame) and the nearest object
+     below it belongs to the flagged function, one of its callers, or the
+     globals. That object is the one being overflowed; or
+  2. it lands inside a *different* object than the previous access from
+     the same instruction, starting right where that one ended: a linear
+     copy running from one buffer into its neighbour.
+
+Register save/restore instructions (push/pop and SP-writeback stm/ldm)
+are never variable accesses and are ignored; the epilogue's `pop {..., pc}`
+reads the saved registers just above the locals.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
-from .elfinfo import FunctionInfo, VariableInfo
+from capstone import arm_const as A
+
+from .callgraph import decode_one
+from .elfinfo import ElfGroundTruth, FunctionInfo
 from .emulator_cortexm import MemAccess, RAM_BASE, RAM_SIZE, FLASH_BASE, FLASH_SIZE
 from .schema import Verdict
 
+READ_CWES = {"CWE-125"}
+WRITE_CWES = {"CWE-121", "CWE-787"}
+
+# How far past an object's end an access can land and still be attributed
+# to that object rather than to some unrelated piece of memory higher up.
+MAX_PLAUSIBLE_OVERRUN = 4096
+
+
+@dataclass(frozen=True)
+class MemObject:
+    key: tuple          # (activation or 0 for globals, variable name)
+    name: str
+    owner: str          # function name, or "global"
+    lo: int
+    hi: int
+
+    def contains(self, lo: int, hi: int) -> bool:
+        return self.lo <= lo and hi <= self.hi
 
 
 @dataclass
 class BoundsOracleResult:
-    verdict: Verdict
+    verdict: Optional[Verdict]      # TP when a violation was observed, else None
     detail: str
     violation: Optional[MemAccess] = None
-    window: Optional[tuple] = None   # (lo, hi) resolved concrete address range
-    saw_any_access: bool = True      # False only for the "reached the function but
-                                      # never touched this variable at all" FP case --
-                                      # lets a caller distinguish "verified safe" from
-                                      # "this run just never exercised the code path"
+    window: Optional[tuple] = None  # (lo, hi) of the overflowed object
+    objects_known: int = 0          # DWARF objects the flagged function can see
+    accesses_checked: int = 0       # accesses made while the flagged function was live
 
 
-READ_CWES = {"CWE-125", "CWE_125"}
-WRITE_CWES = {"CWE-121", "CWE_121", "CWE-787", "CWE_787"}
-
-# How far past a variable's declared end an access can land and still
-# plausibly be evidence of THAT variable's own sequential overflow,
-# rather than some completely unrelated access (most commonly: a stack
-# write from a totally different function's frame, landing far above a
-# small, fixed-address global) that merely happens to share the same
-# broad RAM/FLASH region. Without this cap, a small global's [lo, hi)
-# window matches "acc_lo >= lo" against literally any higher RAM address
-# in the whole 64K region, misattributing unrelated stack traffic as a
-# multi-kilobyte "overrun" of an 8-byte buffer. Sized generously above
-# the largest buffer these fixtures declare (init_diagnostics_buffer's
-# 2048 bytes) so a genuine large sequential overflow still triggers.
-MAX_PLAUSIBLE_OVERRUN = 4096
+def _region(addr: int) -> Optional[str]:
+    if RAM_BASE <= addr < RAM_BASE + RAM_SIZE:
+        return "ram"
+    if FLASH_BASE <= addr < FLASH_BASE + FLASH_SIZE:
+        return "flash"
+    return None
 
 
-def _window_for_access(var: VariableInfo, owning_function: FunctionInfo, acc: MemAccess) -> Optional[tuple]:
-    """Resolve the variable's concrete address window using the frame-base
-    snapshot captured AT THE TIME of this specific access (acc.frame_bases),
-    not a single run-wide snapshot. This matters because a function can be
-    entered multiple times (or not yet entered at all when an earlier,
-    unrelated access happens to reuse the same stack bytes) -- using a
-    stale/future frame base would silently produce false matches against
-    completely unrelated writes."""
-    size = var.byte_size or 1
-    if var.is_global:
-        return (var.address, var.address + size)
-    fb = acc.frame_bases.get(owning_function.address)
-    if fb is None:
-        return None
-    lo = fb + var.fbreg_offset
-    return (lo, lo + size)
+def is_register_spill(gt: ElfGroundTruth, pc: int) -> bool:
+    cache = gt.cache.setdefault("spill", {})
+    if pc in cache:
+        return cache[pc]
+    insn = decode_one(gt, pc)
+    spill = False
+    if insn is not None:
+        if insn.id in (A.ARM_INS_PUSH, A.ARM_INS_POP):
+            spill = True
+        elif insn.id in (A.ARM_INS_STMDB, A.ARM_INS_LDM, A.ARM_INS_STM) and insn.writeback \
+                and insn.operands and insn.operands[0].reg == A.ARM_REG_SP:
+            spill = True
+    cache[pc] = spill
+    return spill
 
 
-def _contained_in_sibling(acc_lo: int, acc_hi: int, var: VariableInfo,
-                           all_vars: list, cfa: Optional[int]) -> bool:
-    """A write/read that lands entirely inside some OTHER declared
-    variable's own DWARF window is that sibling variable being
-    legitimately accessed (e.g. a clamped-length local computed right
-    after `buf` in the same frame, or -- for globals -- the next static
-    laid out immediately after `var` in .bss, which startup code's
-    bulk zero-init loop will touch as one contiguous pass regardless of
-    individual variable boundaries) -- not evidence of `var` overflowing.
-    Handles both global siblings (absolute .address, cfa-independent)
-    and local siblings (frame-relative fbreg_offset, needs cfa) in the
-    same pass, since the candidate pool mixes both kinds. Uses exact
-    per-variable windows (not an address-range heuristic), so it cannot
-    accidentally swallow a genuine overflow: a real smash's write
-    extends past every declared variable's own bounds, so it will never
-    be "fully contained" in a sibling's window."""
-    for v in all_vars:
-        if v is var:
-            continue
-        size = v.byte_size or 1
-        if v.is_global:
-            v_lo = v.address
-        elif v.fbreg_offset is not None and cfa is not None:
-            v_lo = cfa + v.fbreg_offset
-        else:
-            continue
-        v_hi = v_lo + size
-        if acc_lo >= v_lo and acc_hi <= v_hi:
-            return True
-    return False
+def _frame_objects(gt: ElfGroundTruth, frame, cache: dict) -> list:
+    objs = cache.get(frame.activation)
+    if objs is None:
+        f = gt.function_at(frame.func)
+        owner = f.name if f else hex(frame.func)
+        objs = [MemObject(key=(frame.activation, v.name), name=v.name, owner=owner,
+                          lo=frame.cfa + v.fbreg_offset, hi=frame.cfa + v.fbreg_offset + (v.byte_size or 1))
+                for v in gt.variables_by_function.get(frame.func, [])]
+        cache[frame.activation] = objs
+    return objs
 
 
-def check(cwe_id: str, var: VariableInfo, owning_function: FunctionInfo, run_result,
-          all_function_vars: Optional[list] = None,
-          function_entry_addrs: Optional[set] = None) -> BoundsOracleResult:
+def _describe(kind: str, acc: MemAccess, obj: MemObject, how: str, gt: ElfGroundTruth) -> str:
+    lo, hi = acc.address, acc.address + acc.size
+    pc_func = gt.function_at(acc.pc)
+    where = f"PC=0x{acc.pc:x}" + (f" in {pc_func.name}" if pc_func else "")
+    return (f"Out-of-bounds {kind} at {where}: accessed [0x{lo:x}, 0x{hi:x}) but "
+            f"'{obj.name}' ({obj.owner}) is only [0x{obj.lo:x}, 0x{obj.hi:x}) "
+            f"({obj.hi - obj.lo} bytes); {how}.")
 
-    """
-    Direction-aware overflow check with prologue-push exclusion.
 
-    Two design points, both learned the hard way from real emulation
-    traces on these fixtures:
-
-    1. Direction awareness -- a real sequential buffer overflow (what
-       CWE-121/125/787 findings describe) always writes/reads starting
-       AT-OR-AFTER the buffer's own base address and then runs past its
-       upper bound. An access that starts *before* the buffer's lower
-       bound is a different piece of memory entirely (a sibling local's
-       own slot, a nested callee's own frame at a lower stack address,
-       etc.) and must not be misattributed to `var` overflowing.
-
-    2. Prologue-push exclusion -- GCC ARM/Thumb -O0 begins every
-       function with 'push {r7,lr}' (a register spill) as its literal
-       first instruction. That single instruction is NOT a variable
-       access, and critically, the bytes it writes (right above the
-       highest local) can be EITHER innocuous framework bookkeeping
-       (a callee just being called) OR, in a real overflow, exactly the
-       bytes a runaway copy loop smashes through on its way past the
-       buffer -- so an address-range "guard band" heuristic can't
-       reliably tell the two apart. What *can* tell them apart: the
-       push instruction executes exactly once at a fixed, known PC
-       (the function's entry address), while a real overflow's writes
-       come from a *different* PC (the copy loop's store instruction),
-       typically executed repeatedly. So we exclude accesses purely by
-       PC == a known function-entry address, independent of address
-       range -- this correctly keeps a genuine overflow's smash through
-       that same byte range visible (since the smashing writes carry
-       the copy loop's PC, not the entry PC).
-    """
-    want_write = cwe_id.upper().replace("_", "-") in WRITE_CWES or cwe_id in WRITE_CWES
-    want_read = cwe_id.upper().replace("_", "-") in READ_CWES or cwe_id in READ_CWES
-
-    # Whether `var`'s concrete address window is resolvable AT ALL during
-    # this run is a property of the run (did we ever observe
-    # owning_function's frame base?), NOT of whether any particular
-    # access happened to relate to it. These are deliberately kept
-    # separate: a safe function that bounds-checks and returns BEFORE
-    # ever touching `var` produces zero relevant accesses to it, but its
-    # frame was still perfectly resolvable -- that is a legitimate FP
-    # ("reached the code, no OOB access occurred"), not an Inconclusive
-    # ("we have no idea what memory this variable even lives in").
-    if var.is_global:
-        var_resolvable = True
-    else:
-        var_resolvable = run_result.entry_sp_snapshots.get(owning_function.address) is not None
-
-    last_window = None
-    saw_any_resolvable_access = False
+def check(gt: ElfGroundTruth, cwe_id: str, func: FunctionInfo, run_result,
+          max_overrun: int = MAX_PLAUSIBLE_OVERRUN) -> BoundsOracleResult:
+    want_write = cwe_id in WRITE_CWES
+    kind = "write" if want_write else "read"
+    globals_ = [MemObject(key=(0, v.name), name=v.name, owner="global",
+                          lo=v.address, hi=v.address + (v.byte_size or 1))
+                for v in gt.global_variables.values()]
+    frame_cache: dict = {}
+    last_by_pc: dict = {}   # pc -> (object, access end, activation)
+    checked = 0
 
     for acc in run_result.accesses:
-
-        if want_write and not acc.is_write:
+        if acc.is_write != want_write:
             continue
-        if want_read and acc.is_write:
+        own = acc.frame_of(func.address)
+        if own is None:
             continue
-
-        if function_entry_addrs is not None and acc.pc in function_entry_addrs:
-            # A function's own 'push {r7,lr}' prologue instruction --
-            # register-spill housekeeping, never a variable access.
+        region = _region(acc.address)
+        if region is None or is_register_spill(gt, acc.pc):
             continue
+        checked += 1
 
-        window = _window_for_access(var, owning_function, acc)
-        if window is None:
-            # owning_function hadn't been entered yet at the time of this
-            # access -- it cannot possibly be the access the finding is
-            # about, so skip rather than mis-attribute it.
-            continue
+        # Overflow sources: the flagged function's frame, its callers'
+        # (a pointer passed down), and globals. Deeper callees' locals are
+        # legitimate targets but not something this finding is about.
+        sources = list(globals_)
+        everything = list(globals_)
+        own_depth = acc.frames.index(own)
+        for depth, fr in enumerate(acc.frames):
+            objs = _frame_objects(gt, fr, frame_cache)
+            everything.extend(objs)
+            if depth <= own_depth:
+                sources.extend(objs)
 
-        lo, hi = window
-        acc_lo = acc.address
-        acc_hi = acc.address + acc.size
+        lo, hi = acc.address, acc.address + acc.size
+        innermost = acc.frames[-1].activation
+        inside = next((o for o in everything if o.contains(lo, hi)), None)
+        prev = last_by_pc.get(acc.pc)
 
-        # An access outside the memory region `var` itself lives in
-        # (e.g. an MMIO peripheral register write while `var` is a
-        # stack local in RAM) is categorically unrelated -- numeric
-        # address comparisons alone can't tell "past the buffer" from
-        # "a totally different address space" apart, so gate on region
-        # membership explicitly.
-        var_region = None
-        if RAM_BASE <= lo < RAM_BASE + RAM_SIZE:
-            var_region = (RAM_BASE, RAM_BASE + RAM_SIZE)
-        elif FLASH_BASE <= lo < FLASH_BASE + FLASH_SIZE:
-            var_region = (FLASH_BASE, FLASH_BASE + FLASH_SIZE)
-        if var_region is not None:
-            r_lo, r_hi = var_region
-            if not (r_lo <= acc_lo < r_hi):
-                continue
-
-        if acc_lo < lo:
-
-            # Access begins before the buffer even starts -- this is a
-            # different piece of memory entirely, not `var` overflowing.
-            continue
-
-        if acc_hi - hi > MAX_PLAUSIBLE_OVERRUN:
-            # Implausibly far past the end -- almost certainly an
-            # unrelated access elsewhere in the same broad region, not
-            # `var` overflowing. See MAX_PLAUSIBLE_OVERRUN above.
+        if inside is not None:
+            if prev is not None:
+                p_obj, p_end, p_act = prev
+                sequential = p_end <= lo <= p_end + max(acc.size, 8)
+                same_run = p_act == innermost or p_obj.owner == "global"
+                if (p_obj.key != inside.key and p_obj in sources and sequential and same_run
+                        and lo >= p_obj.hi and lo - p_obj.hi < max_overrun):
+                    return BoundsOracleResult(
+                        verdict=Verdict.TP, violation=acc, window=(p_obj.lo, p_obj.hi),
+                        objects_known=len(sources), accesses_checked=checked,
+                        detail=_describe(kind, acc, p_obj,
+                                         f"the same instruction ran contiguously from '{p_obj.name}' "
+                                         f"into '{inside.name}', {hi - p_obj.hi} bytes past its end", gt))
+            last_by_pc[acc.pc] = (inside, hi, innermost)
             continue
 
-        if all_function_vars is not None:
-            cfa = acc.frame_bases.get(owning_function.address)
-            if _contained_in_sibling(acc_lo, acc_hi, var, all_function_vars, cfa):
-                # A legitimate access to a *different* declared variable
-                # (local or global) that happens to sit immediately
-                # adjacent to `var` -- not `var` overflowing. cfa may be
-                # None here (e.g. this access predates owning_function's
-                # own entry, such as startup code zero-initializing
-                # .bss); _contained_in_sibling degrades gracefully by
-                # only matching global siblings in that case.
-                continue
+        below = [o for o in sources if o.lo <= lo and _region(o.lo) == region]
+        if below:
+            base = max(below, key=lambda o: o.lo)
+            if hi > base.hi and lo - base.hi < max_overrun:
+                return BoundsOracleResult(
+                    verdict=Verdict.TP, violation=acc, window=(base.lo, base.hi),
+                    objects_known=len(sources), accesses_checked=checked,
+                    detail=_describe(kind, acc, base,
+                                     f"overrun = {hi - base.hi} bytes past the end", gt))
+        last_by_pc.pop(acc.pc, None)
 
-        saw_any_resolvable_access = True
-
-        last_window = window
-
-        if acc_hi > hi:
-            kind = "write" if acc.is_write else "read"
-            return BoundsOracleResult(
-                verdict=Verdict.TP,
-                detail=(f"Out-of-bounds {kind} at PC=0x{acc.pc:x}: accessed "
-                        f"[0x{acc_lo:x}, 0x{acc_hi:x}) but '{var.name}' is only "
-                        f"[0x{lo:x}, 0x{hi:x}) ({hi - lo} bytes). "
-                        f"Overrun = {acc_hi - hi} bytes past the end."),
-                violation=acc,
-                window=window,
-            )
-
-    if not var_resolvable:
-        return BoundsOracleResult(
-            verdict=Verdict.INCONCLUSIVE,
-            detail=(f"Could not resolve a concrete address window for variable "
-                    f"'{var.name}' (owning function '{owning_function.name}' never "
-                    f"executed during this run, so its frame base was never "
-                    f"observed)."),
-        )
-
-    # var_resolvable is True but we may never have seen a single relevant
-    # access to it (e.g. a bounds-checked function that returns before
-    # ever touching var) -- compute its window directly for the report
-    # rather than relying on last_window, which requires at least one
-    # qualifying access to have been set.
-    if last_window is None:
-        if var.is_global:
-            last_window = (var.address, var.address + (var.byte_size or 1))
-        else:
-            fb = run_result.entry_sp_snapshots[owning_function.address]
-            lo = fb + var.fbreg_offset
-            last_window = (lo, lo + (var.byte_size or 1))
-
-    lo, hi = last_window
-    no_access_note = "" if saw_any_resolvable_access else (
-        " (in fact, no access to it was observed at all -- the flagged "
-        "code path evidently returned or branched away before ever "
-        "touching it)")
+    n_objects = len(globals_) + len(gt.variables_for(func))
     return BoundsOracleResult(
-        verdict=Verdict.FP,
-        detail=(f"Emulated execution reached the flagged code and performed all "
-                f"its accesses to '{var.name}' strictly within its actual "
-                f"DWARF-recovered bounds [0x{lo:x}, 0x{hi:x}) ({hi - lo} bytes)"
-                f"{no_access_note}. No out-of-bounds access was observed."),
-        window=last_window,
-        saw_any_access=saw_any_resolvable_access,
-    )
-
+        verdict=None, objects_known=n_objects, accesses_checked=checked,
+        detail=(f"No out-of-bounds {kind} observed: {checked} {kind}(s) made while "
+                f"'{func.name}' was live all landed inside a live object ({n_objects} "
+                f"DWARF-described objects in scope)."))

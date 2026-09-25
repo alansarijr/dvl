@@ -16,8 +16,7 @@
       "line": "good.c:18",
       "cwe": "CWE-121",
       "expected_verdict": "FP",
-      "reason": "fill_status stays in bounds; main's later writes to its own local are unrelated.",
-      "xfail": "point 2: frame bases outlive the function's return"
+      "reason": "fill_status stays in bounds; main's later writes to its own local are unrelated."
     }
   ]
 }

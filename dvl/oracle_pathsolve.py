@@ -24,14 +24,17 @@ any straightforward way, and none of the hard problems this MVP targets
 need it -- see pipeline.py's is_irq_only() branch, which never calls
 into this module.
 
-Anti-explosion design (the same failure mode the Unicorn harness's
-poll-breaker exists to avoid, per the prompt's "Known Hard Problems" on
-MMIO stubbing): the UART status register (SR) is modeled CONCRETELY,
-using the identical read-count-threshold poll-break rule as
-dvl.mmio.MmioModel -- so control-flow forking stays bounded exactly like
-the concrete harness. Only the UART data register (DR) -- the actual
-attacker-controlled bytes -- is left symbolic, which is the only place
-a magic-value gate could actually live.
+Anti-explosion design: the UART status register (SR) is concrete, and
+only the first few data-register (DR) bytes are symbolic. The UART model
+here matches what the Unicorn replay will see: RXNE is set while bytes
+remain in `prefix + filler + '\n'`, the filler is 'A', and nothing
+arrives after that. All UART state lives in state.globals so each angr
+state (each branch) counts its own reads.
+
+r0-r3 are explicit symbols because the search starts at the flagged
+function's entry with its arguments unknown; the solved values are
+returned so the replay uses the same arguments. All other registers and
+memory are zero-filled, like the Unicorn harness's fresh RAM.
 """
 from __future__ import annotations
 
@@ -40,10 +43,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .elfinfo import ElfGroundTruth
-from .mmio import (
-    PERIPH_BASE, UART0_SR, UART0_DR, UART_SR_TXE, UART_SR_RXNE,
-    GENERIC_POLL_BREAK_THRESHOLD,
-)
+from .mmio import PERIPH_BASE, UART0_SR, UART0_DR, UART_SR_TXE, UART_SR_RXNE
 
 LR_SENTINEL = 0xFFFFFFFE
 
@@ -58,6 +58,7 @@ class PathSolveResult:
     uart_bytes: bytes
     detail: str
     steps_used: int = 0
+    args: tuple = (0, 0, 0, 0)     # solved r0-r3 at the function's entry
 
 
 def _fault_avoid_addrs(gt: ElfGroundTruth) -> set:
@@ -75,29 +76,17 @@ def solve_driving_input(gt: ElfGroundTruth, root_addr: int, target_addr: int,
                          suffix_bytes: int = 32,
                          step_budget: int = 400,
                          time_budget_s: float = 20.0) -> Optional[PathSolveResult]:
-    """Symbolically solve for the first `prefix_bytes` UART bytes that
-    drive execution from root_addr to target_addr AT LEAST ONCE, then
-    append a generic `suffix_bytes`-long 'A'-filled, newline-terminated
-    tail -- identical in spirit to pipeline.py's own GENERIC_RESET_PAYLOAD
-    -- and return the concatenation.
+    """Symbolically solve for the first `prefix_bytes` UART bytes (and the
+    r0-r3 arguments) that drive execution from root_addr to target_addr at
+    least once, and return them followed by a 'A'-filled, newline-terminated
+    tail of `suffix_bytes`.
 
-    Deliberately NOT solving for the whole run: reaching target_addr once
-    only proves the code path is reachable (e.g. got past a magic-value
-    gate), not that a loop-driven overflow actually happened -- the first
-    pass through a vulnerable copy loop is typically still in-bounds.
-    Proving the overflow itself is left to the caller replaying the
-    returned bytes through the real Unicorn harness + oracle_bounds,
-    exactly as it does for the generic driver. Only the small solved
-    prefix is left symbolic during the angr run; every later UART read
-    resolves to a concrete filler byte so control flow can't keep
-    forking once the gate has been satisfied -- that bound is what keeps
-    this from hitting the same explosion risk as a fully symbolic MMIO
-    model.
+    Only reaching the target is solved for; the first pass through a copy
+    loop is usually still in bounds, so proving the overflow is left to the
+    caller replaying these bytes through the Unicorn harness.
 
-    Returns None if angr is unavailable, the exploration budget is
-    exhausted, or no satisfying path exists -- all three fail closed to
-    "no solved input", never an exception the caller has to handle
-    specially."""
+    Returns None if angr is unavailable, the budget runs out, or no path
+    exists."""
     try:
         import angr
         import claripy
@@ -105,43 +94,49 @@ def solve_driving_input(gt: ElfGroundTruth, root_addr: int, target_addr: int,
         return None
 
     try:
-        project = angr.Project(gt.path, main_opts={"backend": "elf"},
-                                auto_load_libs=False)
+        project = gt.cache.get("angr_project")
+        if project is None:
+            project = angr.Project(gt.path, main_opts={"backend": "elf"}, auto_load_libs=False)
+            gt.cache["angr_project"] = project
     except Exception:
         return None
 
-    sr_read_counts: dict = {}
-    uart_syms: list = []
     uart0_sr_abs = PERIPH_BASE + UART0_SR
     uart0_dr_abs = PERIPH_BASE + UART0_DR
+    stream_len = prefix_bytes + suffix_bytes + 1   # prefix + filler + '\n'
 
     def mem_read_hook(state):
-        addr = state.inspect.mem_read_address
+        attrs = state.inspect.attrs
+        addr = attrs.mem_read_address
         if addr is None or addr.symbolic:
             return
         addr_c = state.solver.eval(addr)
-        width = state.inspect.mem_read_length * 8
+        width = attrs.mem_read_length * 8
+        n = state.globals.get("uart_n", 0)
 
         if addr_c == uart0_sr_abs:
-            pc = state.solver.eval(state.regs.pc)
-            cnt = sr_read_counts.get(pc, 0) + 1
-            sr_read_counts[pc] = cnt
-            rxne = UART_SR_RXNE if cnt >= GENERIC_POLL_BREAK_THRESHOLD else 0
-            state.inspect.mem_read_expr = claripy.BVV(UART_SR_TXE | rxne, width)
+            rxne = UART_SR_RXNE if n < stream_len else 0
+            attrs.mem_read_expr = claripy.BVV(UART_SR_TXE | rxne, width)
         elif addr_c == uart0_dr_abs:
-            if len(uart_syms) >= prefix_bytes:
-                # Beyond the solved prefix: deterministic filler, so
-                # nothing downstream keeps branching on data values.
-                state.inspect.mem_read_expr = claripy.BVV(ord("A"), width)
+            if n >= stream_len:
+                attrs.mem_read_expr = claripy.BVV(0, width)
                 return
-            sym = claripy.BVS(f"uart_rx_{len(uart_syms)}", 8)
-            uart_syms.append(sym)
-            state.inspect.mem_read_expr = (
-                claripy.ZeroExt(width - 8, sym) if width > 8 else sym
-            )
+            state.globals["uart_n"] = n + 1
+            if n < prefix_bytes:
+                sym = claripy.BVS(f"uart_rx_{n}", 8)
+                state.globals["uart_syms"] = state.globals.get("uart_syms", ()) + (sym,)
+                value = sym
+            else:
+                value = claripy.BVV(ord("A") if n < stream_len - 1 else ord("\n"), 8)
+            attrs.mem_read_expr = claripy.ZeroExt(width - 8, value) if width > 8 else value
 
     try:
-        state = project.factory.blank_state(addr=root_addr | 1)
+        state = project.factory.blank_state(
+            addr=root_addr | 1,
+            add_options={angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
+                         angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS})
+        args = tuple(claripy.BVS(f"arg{i}", 32) for i in range(4))
+        state.regs.r0, state.regs.r1, state.regs.r2, state.regs.r3 = args
         state.regs.sp = 0x20000000 + 0x00010000 - 0x400
         state.regs.lr = LR_SENTINEL
         state.inspect.b("mem_read", when=angr.BP_AFTER, action=mem_read_hook)
@@ -166,22 +161,25 @@ def solve_driving_input(gt: ElfGroundTruth, root_addr: int, target_addr: int,
             return None
 
         found = simgr.found[0]
-        solved_prefix = bytes(found.solver.eval(sym) for sym in uart_syms)
+        syms = found.globals.get("uart_syms", ())
+        solved_prefix = bytes(found.solver.eval(sym) for sym in syms)
+        solved_args = tuple(found.solver.eval(a) for a in args)
     except Exception:
         return None
 
+    # Pad the prefix to its full width so the replayed stream lines up with
+    # the one angr reasoned about.
+    solved_prefix = solved_prefix + b"A" * (prefix_bytes - len(solved_prefix))
     uart_bytes = solved_prefix + (b"A" * suffix_bytes) + b"\n"
 
     return PathSolveResult(
         uart_bytes=uart_bytes,
-        detail=(f"angr symbolically solved a {len(solved_prefix)}-byte UART prefix "
-                f"({solved_prefix!r}) driving execution from 0x{root_addr:x} to "
-                f"0x{target_addr:x} at least once (reached in {steps} block-steps; "
-                f"UART status register kept concrete via the same poll-break rule "
-                f"as the Unicorn harness). A generic {suffix_bytes}-byte 'A'-filled, "
-                f"newline-terminated tail was appended after the solved prefix "
-                f"(same pattern as the generic driver) so the replayed run can "
-                f"actually drive a loop-based overflow past the first, in-bounds "
-                f"pass through the flagged instruction."),
+        args=solved_args,
+        detail=(f"angr solved a {len(syms)}-byte UART prefix ({solved_prefix[:len(syms)]!r}) "
+                f"and arguments r0-r3=({', '.join(hex(a) for a in solved_args)}) that drive "
+                f"execution from 0x{root_addr:x} to 0x{target_addr:x} (reached in {steps} "
+                f"block-steps). A {suffix_bytes}-byte 'A' tail and a newline follow, so the "
+                f"replayed run can go past the first, in-bounds pass through the flagged "
+                f"instruction."),
         steps_used=steps,
     )
