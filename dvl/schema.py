@@ -62,7 +62,7 @@ class Finding:
 @dataclass
 class Evidence:
     """The proof artifact backing a verdict -- concrete input, trace, path."""
-    kind: str                       # "reachability" | "bounds" | "allocsize" | "recovery"
+    kind: str                       # "reachability" | "bounds" | "retaddr" | "pathsolve" | "allocsize" | "recovery"
     detail: str = ""
     trace: list = field(default_factory=list)      # list of {pc, instr, ...}
     triggering_input: Optional[dict] = None
@@ -90,6 +90,8 @@ class VerdictRecord:
             "notes": self.notes,
             "evidence_kind": self.evidence.kind,
             "evidence_detail": self.evidence.detail,
+            "call_path": self.evidence.extra.get("call_path"),
             "trace": self.evidence.trace,
+            "evidence_extra": {k: v for k, v in self.evidence.extra.items() if k != "call_path"},
             "ground_truth_corrections": self.ground_truth_corrections,
         }

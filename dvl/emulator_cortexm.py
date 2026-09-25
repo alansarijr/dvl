@@ -45,6 +45,9 @@ MAX_HIJACK_RECOVERIES = 16
 GUARD_BYTES = 0x10000        # mapped above RAM so an overflow off its end is recorded, not fatal
 _CALLEE_SAVED = (UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
                  UC_ARM_REG_R8, UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11)
+_SNAPSHOT_REGS = (("r0", UC_ARM_REG_R0), ("r1", UC_ARM_REG_R1), ("r2", UC_ARM_REG_R2),
+                  ("r3", UC_ARM_REG_R3)) + tuple((f"r{i + 4}", r) for i, r in enumerate(_CALLEE_SAVED)) + (
+                  ("sp", UC_ARM_REG_SP), ("lr", UC_ARM_REG_LR))
 
 
 @dataclass(frozen=True)
@@ -109,7 +112,11 @@ class CortexM3Harness:
     repeatedly on the same instance (reset, then one call per simulated
     interrupt); RAM and the access log persist across calls."""
 
-    def __init__(self, gt: ElfGroundTruth, profile: Optional[target.TargetProfile] = None):
+    def __init__(self, gt: ElfGroundTruth, profile: Optional[target.TargetProfile] = None,
+                 snapshot_at: Optional[int] = None):
+        """snapshot_at: index into the access log; when that access happens,
+        the registers are captured into self.snapshot (used to replay a run
+        up to its violating access)."""
         self.gt = gt
         self.profile = profile if profile is not None and profile.resolved else target.resolve(gt, profile)
         self.uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB)
@@ -134,6 +141,8 @@ class CortexM3Harness:
         self._rets: Counter = Counter()
         self._activations = itertools.count(1)
         self._lr_slots: dict = {}
+        self._snapshot_at = snapshot_at
+        self.snapshot: Optional[dict] = None
         self._recoveries: list = []
         # Registered once per instance: registering per run_from() call would
         # stack duplicate callbacks and multiply-count every access.
@@ -241,12 +250,19 @@ class CortexM3Harness:
         self._accesses.append(MemAccess(
             pc=self._pc, address=address, size=size, is_write=is_write,
             value=value if is_write else None, frames=self._live))
+        self._maybe_snapshot(uc)
+
+    def _maybe_snapshot(self, uc):
+        if self._snapshot_at is not None and len(self._accesses) == self._snapshot_at + 1:
+            self.snapshot = {name: f"0x{uc.reg_read(reg):08x}" for name, reg in _SNAPSHOT_REGS}
+            self.snapshot["pc"] = f"0x{self._pc:08x}"
 
     def _unmapped_hook(self, uc, access, address, size, value, user_data):
         is_write = access == UC_MEM_WRITE_UNMAPPED
         self._accesses.append(MemAccess(
             pc=self._pc, address=address, size=size, is_write=is_write,
             value=value if is_write else None, frames=self._live, unmapped=True))
+        self._maybe_snapshot(uc)
         return False   # let Unicorn raise the fault
 
     # -- running -------------------------------------------------------------

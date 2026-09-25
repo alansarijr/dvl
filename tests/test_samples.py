@@ -34,3 +34,19 @@ def test_gateway_firmware_report():
         "finding_event_log_overflow": "TP",
         "finding_auth_buf_overflow": "TP",
     }
+
+
+@pytest.mark.slow
+def test_gateway_tp_evidence_is_complete():
+    records = _run("sample_firmware/gateway_fw.elf", "sample_firmware/gateway_fw_report.json",
+                   target.load(str(ROOT / "targets" / "dvl-fixtures.toml")))
+    rec = records["finding_uart_cmd_overflow"].to_json()
+    violation = rec["trace"][-1]
+    assert violation["violation"] and violation["line"] == "gateway_fw.c:44"
+    assert rec["call_path"][-1] == "process_uart_command"
+    assert rec["triggering_input"]["consumed"] > 16          # past the 16-byte cmd_buf
+    regs = rec["evidence_extra"]["registers_at_violation"]
+    assert int(regs["pc"], 16) == int(violation["pc"], 16)   # replay stopped at the same access
+
+    irq = records["finding_event_log_overflow"].to_json()
+    assert irq["triggering_input"]["entry"] == "interrupt 'UART0_IRQHandler' x16"

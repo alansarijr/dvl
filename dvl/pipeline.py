@@ -1,48 +1,34 @@
 """
-Top-level orchestration: ties ingest -> reachability -> path-driving ->
-CWE-specific oracle -> VerdictRecord together for an arbitrary
-(binary, SAST report) pair.
+Top-level orchestration: finding -> static reachability -> CWE-specific
+oracle -> VerdictRecord, for any (binary, SAST report) pair.
 
-Capability-tier detection: the fixtures/baremetal/* targets share one
-concrete memory map (FLASH @ 0x0 with a real Cortex-M vector table, RAM @
-0x20000000) that our Unicorn harness knows how to set up. A real-world
-firmware image handed to this tool may not match that shape at all (e.g.
-Firmware Samples/row_413_bad.arm.elf: entry 0x10418, load segments
-starting at 0x10000 -- not our bare-metal vector-table layout). Rather
-than guess wrong and silently emulate garbage, we detect this up front
-and only apply techniques valid independent of memory-map assumptions
-(static instruction re-validation, in particular) for anything that
-doesn't match -- this is exactly what EngineTier.C_STATIC_ONLY exists
-for in dvl.schema.
+Order of checks for a finding:
 
-Generic path-driving strategy for CWE-121/125/787 (step 4 of the
-pipeline, prompt section 4): run_fixtures.py's per-scenario drivers
-(run_case_01_style / _04_style / _05_style) exist because each fixture
-was hand-built to isolate ONE hard problem. A real finding doesn't come
-labeled with which of those shapes it is, so this module picks between
-exactly two generic strategies automatically, using
-oracle_reachability.is_irq_only() as the sole signal:
+  1. Static reachability (any image, any CWE). Unreachable code is FP.
+  2. CWE-789: static allocation-size check against the profile's threshold.
+  3. CWE-121/125/787: if the target profile says the image can be emulated
+     as a Cortex-M, drive it and run the trigger oracles; otherwise
+     Inconclusive with the reason.
 
-  - IRQ-only (fixture-05 shape): seed emulation directly at the flagged
-    function's own entry point, repeatedly, once per simulated
-    interrupt -- a plain reset-vector run provably never reaches it.
-  - everything else (fixtures 01/04/06 shape -- input baked into a call
-    site OR fed through the UART RX queue): a single reset-vector run
-    with a generous generic UART payload preloaded covers both, since
-    an MMIO-gated read loop consumes it if present, and a baked-in call
-    site ignores it if not.
+Driving (CWE-121/125/787) picks one of two generic concrete strategies:
 
-Neither strategy performs angr-style symbolic path search; both are
-concrete-input strategies per the prompt's step 4 "concrete/directed
-execution" option. A finding whose real trigger condition needs a
-specific, non-generic input value (e.g. an exact magic number an
-if-check compares against) is outside what this generic driver can
-find -- exactly the situation run_fixtures.py's INCONCLUSIVE fixture
-case (06's good twin, before the resolvability fix) was designed to
-exercise, and why the "Inconclusive" verdict class exists.
+  - IRQ-only functions (reachable only through the vector table): run
+    reset until the firmware idles, then deliver the handler as
+    interrupts, one queued UART byte each.
+  - Everything else: run from reset with a generic UART payload, which
+    covers input baked into a call site and input read over UART.
+
+If the flagged instruction never executes, a run that read no input and
+ended naturally proves it cannot (FP). Otherwise angr solves for an input
+from the flagged function's entry (oracle_pathsolve) and the result is
+replayed in Unicorn; a verdict from that path is medium confidence.
+
+Every driving strategy is a DriverSpec so a run can be replayed exactly,
+which is how the register snapshot at a violation is captured.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 from . import elfinfo, oracle_allocsize, oracle_reachability, oracle_bounds, oracle_pathsolve, oracle_retaddr
@@ -52,75 +38,158 @@ from .schema import Finding, Verdict, VerdictRecord, Evidence, EngineTier
 
 GENERIC_ISR_PAYLOAD = bytes([ord('A')] * 16)              # no '\n' -> any index-reset logic never fires
 GENERIC_RESET_PAYLOAD = bytes([ord('A')] * 64) + b'\n'     # generous, terminated, for UART-fed loops
+TRACE_CONTEXT = 16   # accesses shown before the violating one
 
 
-def _drive(gt: elfinfo.ElfGroundTruth, profile, finding: Finding, func, irq_only: bool):
-    """Runs the generic concrete driver. Returns (run_result, description)."""
-    harness = CortexM3Harness(gt, profile)
+@dataclass(frozen=True)
+class DriverSpec:
+    kind: str                  # "reset" | "irq" | "function"
+    payload: bytes
+    entry: int = 0             # IRQ handler or function to seed at
+    entry_name: str = ""
+    irq_count: int = 0
+    args: tuple = (0, 0, 0, 0)
+    source: str = "generic"    # "generic" | "angr"
+
+    def describe(self, stopped: str) -> str:
+        if self.kind == "irq":
+            return (f"IRQ driver: '{self.entry_name}' is reachable only via the vector table, so the "
+                    f"firmware ran from reset until it went idle ({stopped}) and {self.irq_count} "
+                    f"interrupts were then delivered to it, each with one queued UART byte.")
+        if self.kind == "reset":
+            return (f"Reset driver: ran from the reset handler with a generic {len(self.payload)}-byte "
+                    f"UART payload preloaded (stopped: {stopped}).")
+        return (f"Function driver: ran '{self.entry_name}' from its entry with r0-r3="
+                f"({', '.join(hex(a) for a in self.args)}) and a {len(self.payload)}-byte "
+                f"{self.source} UART payload (stopped: {stopped}).")
+
+
+@dataclass
+class Outcome:
+    tp: bool
+    kind: str                  # "bounds" | "retaddr"
+    detail: str
+    objects_known: int
+    violation: object = None   # MemAccess, when the oracle pinned one
+
+
+def _execute(gt, profile, finding: Finding, spec: DriverSpec, snapshot_at: Optional[int] = None):
+    """Runs a DriverSpec. Returns (run_result, harness, boot_or_run_stop_reason)."""
+    harness = CortexM3Harness(gt, profile, snapshot_at=snapshot_at)
     harness.watch(finding.address)
-    if irq_only:
+    if spec.kind == "irq":
         # Let reset and main() set up whatever state the handler relies on,
-        # then deliver one interrupt per queued UART byte from that idle
-        # point, as the NVIC would.
+        # then deliver interrupts from that idle point, as the NVIC would.
         boot = harness.run_from(gt.entry, stop_at_idle=True)
-        harness.set_input_queue(GENERIC_ISR_PAYLOAD)
+        harness.set_input_queue(spec.payload)
         run_result = boot
-        for _ in range(len(GENERIC_ISR_PAYLOAD)):
-            run_result = harness.deliver_irq(func.address)
-        desc = (f"IRQ driver: '{func.name}' is reachable only via the vector table, so the "
-                f"firmware ran from reset until it went idle ({boot.stopped_reason}) and "
-                f"{len(GENERIC_ISR_PAYLOAD)} interrupts were then delivered to it, each with "
-                f"one queued UART byte.")
-    else:
-        harness.set_input_queue(GENERIC_RESET_PAYLOAD)
+        for _ in range(spec.irq_count):
+            run_result = harness.deliver_irq(spec.entry)
+        return run_result, harness, boot.stopped_reason
+    harness.set_input_queue(spec.payload)
+    if spec.kind == "reset":
         run_result = harness.run_from(gt.entry, stop_at_idle=True)
-        desc = (f"Reset driver: ran from the reset handler with a generic "
-                f"{len(GENERIC_RESET_PAYLOAD)}-byte UART payload preloaded "
-                f"(stopped: {run_result.stopped_reason}).")
-    return run_result, desc
+    else:
+        a = spec.args
+        run_result = harness.run_from(spec.entry, r0=a[0], r1=a[1], r2=a[2], r3=a[3])
+    return run_result, harness, run_result.stopped_reason
 
 
-def _check_run(gt, finding: Finding, func, run_result):
-    """Runs the trigger oracles on one run. Returns (tp, kind, detail,
-    objects_known): the DWARF bounds oracle first, then, for write CWEs,
-    the return-address oracle, which also works without debug info."""
+def _check_run(gt, finding: Finding, func, run_result) -> Outcome:
+    """The DWARF bounds oracle first, then, for write CWEs, the
+    return-address oracle, which also works without debug info."""
     res = oracle_bounds.check(gt, finding.cwe_id, func, run_result)
     if res.verdict == Verdict.TP:
-        return True, "bounds", res.detail, res.objects_known
+        return Outcome(True, "bounds", res.detail, res.objects_known, res.violation)
     if finding.cwe_id in oracle_bounds.WRITE_CWES:
         ra = oracle_retaddr.check(gt, func, run_result, bytes(run_result.mmio.input_queue))
         if ra.verdict == Verdict.TP:
-            return True, "retaddr", ra.detail, res.objects_known
+            return Outcome(True, "retaddr", ra.detail, res.objects_known, ra.violation)
         if res.objects_known == 0:
-            return False, "retaddr", ra.detail, 0
-    return False, "bounds", res.detail, res.objects_known
+            return Outcome(False, "retaddr", ra.detail, 0)
+    return Outcome(False, "bounds", res.detail, res.objects_known)
+
+
+def _func_name(gt, addr: int) -> str:
+    f = gt.function_at(addr)
+    return f.name if f else hex(addr)
+
+
+def _trace_entry(gt, acc, violation: bool = False) -> dict:
+    return {
+        "pc": f"0x{acc.pc:x}", "function": _func_name(gt, acc.pc), "line": gt.line_for_address(acc.pc),
+        "op": "write" if acc.is_write else "read", "address": f"0x{acc.address:x}", "size": acc.size,
+        "value": f"0x{acc.value:x}" if acc.value is not None else None,
+        **({"unmapped": True} if acc.unmapped else {}), **({"violation": True} if violation else {}),
+    }
+
+
+def _evidence(gt, profile, finding: Finding, func, spec: DriverSpec, run_result, stopped: str,
+              outcome: Outcome, kind: str, detail: str) -> Evidence:
+    uart = profile.uart
+    ev = Evidence(kind=kind, detail=detail)
+    ev.triggering_input = {
+        "channel": uart.name if uart else None,
+        "bytes": spec.payload.decode("latin-1"),
+        "bytes_hex": spec.payload.hex(),
+        "consumed": run_result.input_consumed,
+        "source": spec.source,
+        "entry": {"reset": "reset handler", "irq": f"interrupt '{spec.entry_name}' x{spec.irq_count}",
+                  "function": f"function '{spec.entry_name}'"}[spec.kind],
+        **({"args": [f"0x{a:x}" for a in spec.args]} if spec.kind == "function" else {}),
+    }
+    ev.extra = {"driver": spec.describe(stopped), "stopped": run_result.stopped_reason,
+                "flagged_instruction_hits": run_result.watch_hits.get(finding.address, 0)}
+    if run_result.recoveries:
+        ev.extra["smashed_returns_recovered"] = run_result.recoveries
+
+    v = outcome.violation
+    if v is not None:
+        idx = next(i for i, a in enumerate(run_result.accesses) if a is v)
+        own = v.frame_of(func.address)
+        before = [a for a in run_result.accesses[:idx] if own is not None and own in a.frames]
+        ev.trace = [_trace_entry(gt, a) for a in before[-TRACE_CONTEXT:]] + [_trace_entry(gt, v, True)]
+        ev.extra["call_path"] = [_func_name(gt, fr.func) for fr in v.frames]
+        ev.extra["violation_line"] = gt.line_for_address(v.pc)
+        _, replay_harness, _ = _execute(gt, profile, finding, spec, snapshot_at=idx)
+        if replay_harness.snapshot is not None:
+            ev.extra["registers_at_violation"] = replay_harness.snapshot
+    return ev
 
 
 def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, profile, finding: Finding, func) -> VerdictRecord:
     irq_only = oracle_reachability.is_irq_only(gt, finding.address)
-    run_result, driver_desc = _drive(gt, profile, finding, func, irq_only)
-    tp, kind, detail, objects_known = _check_run(gt, finding, func, run_result)
+    if irq_only:
+        spec = DriverSpec("irq", GENERIC_ISR_PAYLOAD, entry=func.address, entry_name=func.name,
+                          irq_count=len(GENERIC_ISR_PAYLOAD))
+    else:
+        spec = DriverSpec("reset", GENERIC_RESET_PAYLOAD)
+    run_result, _, stopped = _execute(gt, profile, finding, spec)
+    outcome = _check_run(gt, finding, func, run_result)
     exercised = run_result.watch_hits.get(finding.address, 0) > 0
+    driver_desc = spec.describe(stopped)
 
-    def record(verdict, confidence, detail, notes="", tier=EngineTier.A_FULL_DYNAMIC, kind="bounds"):
+    def record(verdict, confidence, detail, notes="", tier=EngineTier.A_FULL_DYNAMIC, kind="bounds",
+               spec=spec, run_result=run_result, stopped=stopped, outcome=outcome):
+        ev = _evidence(gt, profile, finding, func, spec, run_result, stopped, outcome, kind, detail)
         return VerdictRecord(finding_id=finding.finding_id, verdict=verdict, confidence=confidence,
-                             engine_tier=tier, evidence=Evidence(kind=kind, detail=detail), notes=notes)
+                             engine_tier=tier, evidence=ev, notes=notes)
 
-    if tp:
-        return record(Verdict.TP, "high", f"[{driver_desc}] {detail}", kind=kind)
+    if outcome.tp:
+        return record(Verdict.TP, "high", f"[{driver_desc}] {outcome.detail}", kind=outcome.kind)
 
-    if objects_known == 0 and exercised:
+    if outcome.objects_known == 0 and exercised:
         return record(Verdict.INCONCLUSIVE, "low",
-                      f"[{driver_desc}] The flagged instruction executed. {detail} There are no "
+                      f"[{driver_desc}] The flagged instruction executed. {outcome.detail} There are no "
                       f"DWARF-described objects, so an overflow that stops short of the saved "
                       f"registers would go unseen.",
                       notes="No debug info: the return-address check can confirm a stack smash "
                             "but cannot clear a finding. Needs DWARF or manual review.",
-                      kind=kind)
+                      kind=outcome.kind)
 
     if exercised:
         return record(Verdict.FP, "high", f"[{driver_desc}] Flagged instruction executed "
-                                          f"{run_result.watch_hits[finding.address]} time(s). {detail}")
+                                          f"{run_result.watch_hits[finding.address]} time(s). {outcome.detail}")
 
     if run_result.deterministic and not irq_only:
         return record(Verdict.FP, "high",
@@ -135,23 +204,21 @@ def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, profile, finding: Fin
         # bytes before its gate check.
         solved = oracle_pathsolve.solve_driving_input(gt, profile, func.address, finding.address)
         if solved is not None:
-            harness = CortexM3Harness(gt, profile)
-            harness.watch(finding.address)
-            harness.set_input_queue(solved.uart_bytes)
-            replay = harness.run_from(func.address, r0=solved.args[0], r1=solved.args[1],
-                                      r2=solved.args[2], r3=solved.args[3])
-            r_tp, r_kind, r_detail, r_objects = _check_run(gt, finding, func, replay)
+            s_spec = DriverSpec("function", solved.uart_bytes, entry=func.address, entry_name=func.name,
+                                args=solved.args, source="angr")
+            replay, _, r_stopped = _execute(gt, profile, finding, s_spec)
+            r_outcome = _check_run(gt, finding, func, replay)
             replay_hit = replay.watch_hits.get(finding.address, 0) > 0
             notes = ("Driven by an angr-solved input from the flagged function's own entry, "
                      "not from reset: this shows the bug can be triggered once that function "
                      "runs with these arguments and bytes, not that reset leads there with them. "
                      "Medium confidence for that reason.")
-            if r_tp:
-                return record(Verdict.TP, "medium", f"[{solved.detail}] {r_detail}",
-                              notes=notes, tier=EngineTier.B_PARTIAL_DYNAMIC, kind="pathsolve")
-            if replay_hit and r_objects:
-                return record(Verdict.FP, "medium", f"[{solved.detail}] {r_detail}",
-                              notes=notes, tier=EngineTier.B_PARTIAL_DYNAMIC, kind="pathsolve")
+            again = dict(spec=s_spec, run_result=replay, stopped=r_stopped, outcome=r_outcome,
+                         notes=notes, tier=EngineTier.B_PARTIAL_DYNAMIC, kind="pathsolve")
+            if r_outcome.tp:
+                return record(Verdict.TP, "medium", f"[{solved.detail}] {r_outcome.detail}", **again)
+            if replay_hit and r_outcome.objects_known:
+                return record(Verdict.FP, "medium", f"[{solved.detail}] {r_outcome.detail}", **again)
 
     return record(Verdict.INCONCLUSIVE, "low",
                   f"[{driver_desc}] The flagged instruction at 0x{finding.address:x} never executed "
