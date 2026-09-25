@@ -32,16 +32,11 @@ from capstone import arm_const as A
 
 from .callgraph import decode_one
 from .elfinfo import ElfGroundTruth, FunctionInfo
-from .emulator_cortexm import MemAccess, RAM_BASE, RAM_SIZE, FLASH_BASE, FLASH_SIZE
+from .emulator_cortexm import MemAccess
 from .schema import Verdict
 
 READ_CWES = {"CWE-125"}
 WRITE_CWES = {"CWE-121", "CWE-787"}
-
-# How far past an object's end an access can land and still be attributed
-# to that object rather than to some unrelated piece of memory higher up.
-MAX_PLAUSIBLE_OVERRUN = 4096
-
 
 @dataclass(frozen=True)
 class MemObject:
@@ -63,14 +58,6 @@ class BoundsOracleResult:
     window: Optional[tuple] = None  # (lo, hi) of the overflowed object
     objects_known: int = 0          # DWARF objects the flagged function can see
     accesses_checked: int = 0       # accesses made while the flagged function was live
-
-
-def _region(addr: int) -> Optional[str]:
-    if RAM_BASE <= addr < RAM_BASE + RAM_SIZE:
-        return "ram"
-    if FLASH_BASE <= addr < FLASH_BASE + FLASH_SIZE:
-        return "flash"
-    return None
 
 
 def is_register_spill(gt: ElfGroundTruth, pc: int) -> bool:
@@ -110,8 +97,13 @@ def _describe(kind: str, acc: MemAccess, obj: MemObject, how: str, gt: ElfGround
             f"({obj.hi - obj.lo} bytes); {how}.")
 
 
-def check(gt: ElfGroundTruth, cwe_id: str, func: FunctionInfo, run_result,
-          max_overrun: int = MAX_PLAUSIBLE_OVERRUN) -> BoundsOracleResult:
+def check(gt: ElfGroundTruth, cwe_id: str, func: FunctionInfo, run_result) -> BoundsOracleResult:
+    """max_overrun (from the target profile) bounds how far past an
+    object's end an access can land and still be attributed to it rather
+    than to unrelated memory higher up."""
+    profile = run_result.profile
+    max_overrun = profile.max_plausible_overrun
+    _region = profile.region_of
     want_write = cwe_id in WRITE_CWES
     kind = "write" if want_write else "read"
     globals_ = [MemObject(key=(0, v.name), name=v.name, owner="global",
@@ -127,7 +119,7 @@ def check(gt: ElfGroundTruth, cwe_id: str, func: FunctionInfo, run_result,
         own = acc.frame_of(func.address)
         if own is None:
             continue
-        region = _region(acc.address)
+        region = "unmapped" if acc.unmapped else _region(acc.address)
         if region is None or is_register_spill(gt, acc.pc):
             continue
         checked += 1
@@ -165,15 +157,18 @@ def check(gt: ElfGroundTruth, cwe_id: str, func: FunctionInfo, run_result,
             last_by_pc[acc.pc] = (inside, hi, innermost)
             continue
 
-        below = [o for o in sources if o.lo <= lo and _region(o.lo) == region]
+        # An unmapped access ran off the end of a region, so any object
+        # below it may be the source; otherwise stay within the region.
+        below = [o for o in sources if o.lo <= lo and (acc.unmapped or _region(o.lo) == region)]
         if below:
             base = max(below, key=lambda o: o.lo)
             if hi > base.hi and lo - base.hi < max_overrun:
+                fault = "; the access hit unmapped memory and faulted" if acc.unmapped else ""
                 return BoundsOracleResult(
                     verdict=Verdict.TP, violation=acc, window=(base.lo, base.hi),
                     objects_known=len(sources), accesses_checked=checked,
                     detail=_describe(kind, acc, base,
-                                     f"overrun = {hi - base.hi} bytes past the end", gt))
+                                     f"overrun = {hi - base.hi} bytes past the end{fault}", gt))
         last_by_pc.pop(acc.pc, None)
 
     n_objects = len(globals_) + len(gt.variables_for(func))

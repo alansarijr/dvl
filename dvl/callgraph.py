@@ -129,13 +129,18 @@ def find_vector_table(gt: ElfGroundTruth) -> Optional[tuple]:
     """(address, slot_count) of the Cortex-M vector table, slot 0 being the
     initial SP. Found by section name, then symbol name, then by the
     architectural shape at the lowest loaded address (initial SP followed
-    by the reset handler == ELF entry)."""
-    for name in _VECTOR_SECTIONS:
+    by the reset handler == ELF entry). A target profile can pin the
+    address (and optionally the count) via gt.cache["vector_table_override"]."""
+    override = gt.cache.get("vector_table_override")
+    if override is not None and override[1] is not None:
+        return override
+    for name in (() if override is not None else _VECTOR_SECTIONS):
         if name in gt.sections:
             addr, size, _ = gt.sections[name]
             if size >= 8:
                 return addr, min(size // 4, _MAX_VECTORS)
-    start = next((gt.symbols_by_name[n] for n in _VECTOR_SYMBOLS if n in gt.symbols_by_name), None)
+    start = override[0] if override is not None else next(
+        (gt.symbols_by_name[n] for n in _VECTOR_SYMBOLS if n in gt.symbols_by_name), None)
     if start is None and gt.segments:
         base = min(v for v, _ in gt.segments)
         head = gt.read_bytes(base, 8)

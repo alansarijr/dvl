@@ -1,0 +1,9 @@
+# Fixture 12: memory map and vector table are derived from the ELF; only the
+# peripherals come from the SVD. The SIM registers are the test harness's.
+name = "stm32-like"
+svd = "device.svd"
+svd_uart = "USART1"
+
+[sim]
+exit = 0x40002000
+print = 0x40002004

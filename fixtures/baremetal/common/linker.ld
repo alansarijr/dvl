@@ -1,7 +1,7 @@
 /*
  * Generic Cortex-M3 bare-metal linker script for DVL test fixtures.
  *
- * Memory map (documented, matches targets/cortexm3.yaml used by the tool):
+ * Memory map (documented, matches targets/dvl-fixtures.toml used by the tool):
  *   FLASH : 0x00000000 - 0x0003FFFF  (256K)  -- code, .isr_vector, .rodata
  *   RAM   : 0x20000000 - 0x2000FFFF  (64K)   -- .data, .bss, stack (grows down)
  *

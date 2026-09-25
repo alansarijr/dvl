@@ -3,14 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from dvl import ingest, pipeline
+from dvl import ingest, pipeline, target
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _run(binary, report):
+def _run(binary, report, profile=None):
     findings = ingest.load_report(str(ROOT / report))
-    return {r.finding_id: r for r in pipeline.run(str(ROOT / binary), findings)}
+    return {r.finding_id: r for r in pipeline.run(str(ROOT / binary), findings, profile)}
 
 
 def test_row_413_cwe789_findings_are_small_constant_frames():
@@ -24,7 +24,8 @@ def test_row_413_cwe789_findings_are_small_constant_frames():
 @pytest.mark.slow
 def test_gateway_firmware_report():
     # Ground truth from the header comment of sample_firmware/gateway_fw.c.
-    records = _run("sample_firmware/gateway_fw.elf", "sample_firmware/gateway_fw_report.json")
+    records = _run("sample_firmware/gateway_fw.elf", "sample_firmware/gateway_fw_report.json",
+                   target.load(str(ROOT / "targets" / "dvl-fixtures.toml")))
     assert {k: r.verdict.value for k, r in records.items()} == {
         "finding_uart_cmd_overflow": "TP",
         "finding_header_copy": "FP",

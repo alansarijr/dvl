@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Minimal CMSIS-SVD for fixture 12: just the peripherals the firmware
+     touches, laid out like an STM32F1. -->
+<device schemaVersion="1.1" xmlns:xs="http://www.w3.org/2001/XMLSchema-instance">
+  <name>DVL_STM32_LIKE</name>
+  <peripherals>
+    <peripheral>
+      <name>USART1</name>
+      <baseAddress>0x40013800</baseAddress>
+      <addressBlock><offset>0x0</offset><size>0x400</size><usage>registers</usage></addressBlock>
+      <registers>
+        <register>
+          <name>SR</name>
+          <addressOffset>0x0</addressOffset>
+          <fields>
+            <field><name>RXNE</name><bitOffset>5</bitOffset><bitWidth>1</bitWidth></field>
+            <field><name>TXE</name><bitOffset>7</bitOffset><bitWidth>1</bitWidth></field>
+          </fields>
+        </register>
+        <register>
+          <name>DR</name>
+          <addressOffset>0x4</addressOffset>
+        </register>
+      </registers>
+    </peripheral>
+    <peripheral derivedFrom="USART1">
+      <name>USART2</name>
+      <baseAddress>0x40004400</baseAddress>
+    </peripheral>
+  </peripherals>
+</device>

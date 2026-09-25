@@ -46,36 +46,18 @@ from __future__ import annotations
 from typing import Optional
 
 from . import elfinfo, oracle_allocsize, oracle_reachability, oracle_bounds, oracle_pathsolve, oracle_retaddr
+from . import target
 from .emulator_cortexm import CortexM3Harness
 from .schema import Finding, Verdict, VerdictRecord, Evidence, EngineTier
 
 GENERIC_ISR_PAYLOAD = bytes([ord('A')] * 16)              # no '\n' -> any index-reset logic never fires
 GENERIC_RESET_PAYLOAD = bytes([ord('A')] * 64) + b'\n'     # generous, terminated, for UART-fed loops
-GENERIC_INSTRUCTION_BUDGET = 4_000_000
 
 
-def _looks_like_cortexm_fixture_target(gt: elfinfo.ElfGroundTruth) -> bool:
-    """Heuristic capability-negotiation check: does this binary match the
-    bare-metal Cortex-M vector-table-at-address-0 layout our emulation
-    harness is built for? If isr_vector[0] doesn't look like a plausible
-    initial SP (in some RAM-like high region) or isr_vector[1] doesn't
-    equal the ELF entry point, this is not that kind of target and full
-    dynamic verification is not attempted."""
-    data = gt.read_bytes(0x0, 8)
-    if not data or len(data) < 8:
-        return False
-    initial_sp = int.from_bytes(data[0:4], "little")
-    reset_handler = int.from_bytes(data[4:8], "little") & ~1
-    plausible_sp = initial_sp != 0 and (initial_sp & 0xFFFF0000) != 0
-    matches_entry = reset_handler == gt.entry
-    return plausible_sp and matches_entry
-
-
-def _drive(gt: elfinfo.ElfGroundTruth, finding: Finding, func, irq_only: bool):
+def _drive(gt: elfinfo.ElfGroundTruth, profile, finding: Finding, func, irq_only: bool):
     """Runs the generic concrete driver. Returns (run_result, description)."""
-    harness = CortexM3Harness(gt)
+    harness = CortexM3Harness(gt, profile)
     harness.watch(finding.address)
-    harness.set_instruction_budget(GENERIC_INSTRUCTION_BUDGET)
     if irq_only:
         # Let reset and main() set up whatever state the handler relies on,
         # then deliver one interrupt per queued UART byte from that idle
@@ -114,9 +96,9 @@ def _check_run(gt, finding: Finding, func, run_result):
     return False, "bounds", res.detail, res.objects_known
 
 
-def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, func) -> VerdictRecord:
+def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, profile, finding: Finding, func) -> VerdictRecord:
     irq_only = oracle_reachability.is_irq_only(gt, finding.address)
-    run_result, driver_desc = _drive(gt, finding, func, irq_only)
+    run_result, driver_desc = _drive(gt, profile, finding, func, irq_only)
     tp, kind, detail, objects_known = _check_run(gt, finding, func, run_result)
     exercised = run_result.watch_hits.get(finding.address, 0) > 0
 
@@ -151,11 +133,10 @@ def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, fun
         # for an input that does. Seeded at the flagged function's own
         # entry, so earlier UART consumers in main() cannot eat the solved
         # bytes before its gate check.
-        solved = oracle_pathsolve.solve_driving_input(gt, func.address, finding.address)
+        solved = oracle_pathsolve.solve_driving_input(gt, profile, func.address, finding.address)
         if solved is not None:
-            harness = CortexM3Harness(gt)
+            harness = CortexM3Harness(gt, profile)
             harness.watch(finding.address)
-            harness.set_instruction_budget(GENERIC_INSTRUCTION_BUDGET)
             harness.set_input_queue(solved.uart_bytes)
             replay = harness.run_from(func.address, r0=solved.args[0], r1=solved.args[1],
                                       r2=solved.args[2], r3=solved.args[3])
@@ -181,84 +162,54 @@ def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, fun
                          + ". Needs a more targeted driver or manual review."))
 
 
-def adjudicate(gt: elfinfo.ElfGroundTruth, finding: Finding) -> VerdictRecord:
-    is_cortexm_target = _looks_like_cortexm_fixture_target(gt)
+def adjudicate(gt: elfinfo.ElfGroundTruth, finding: Finding,
+               profile: Optional[target.TargetProfile] = None) -> VerdictRecord:
+    """profile: a target profile (dvl.target.load) or None to derive
+    everything from the ELF. Resolved once per binary."""
+    if profile is None or not profile.resolved:
+        profile = target.resolve(gt, profile)
+
+    def record(verdict, confidence, tier, kind, detail, notes="", extra=None):
+        return VerdictRecord(finding_id=finding.finding_id, verdict=verdict, confidence=confidence,
+                             engine_tier=tier, notes=notes,
+                             evidence=Evidence(kind=kind, detail=detail, extra=extra or {}))
 
     # Static reachability is valid for any ARM image and any CWE: code that
     # cannot run cannot be a true positive.
     r = oracle_reachability.check(gt, finding.address)
     if r.verdict == Verdict.FP:
-        return VerdictRecord(
-            finding_id=finding.finding_id,
-            verdict=Verdict.FP,
-            confidence=r.confidence,
-            engine_tier=EngineTier.C_STATIC_ONLY,
-            evidence=Evidence(kind="reachability", detail=r.detail, extra=r.facts),
-            notes="Refuted by static reachability triage; emulation was not necessary.",
-        )
+        return record(Verdict.FP, r.confidence, EngineTier.C_STATIC_ONLY, "reachability", r.detail,
+                      notes="Refuted by static reachability triage; emulation was not necessary.",
+                      extra=r.facts)
 
     if finding.cwe_id == "CWE-789":
-        # Pure static instruction-identity / constant-immediate check --
-        # valid for ANY arch/target, needs no emulation at all.
-        res = oracle_allocsize.check(gt, finding.address)
-        return VerdictRecord(
-            finding_id=finding.finding_id,
-            verdict=res.verdict,
-            confidence=res.confidence,
-            engine_tier=EngineTier.C_STATIC_ONLY,
-            evidence=Evidence(kind="allocsize", detail=res.detail),
-            notes="" if res.verdict != Verdict.INCONCLUSIVE else
-                  "Allocation size is register-derived; static refutation "
-                  "cannot resolve provenance. Needs dataflow/taint analysis "
-                  "or emulation to confirm/refute.",
-        )
+        ram = profile.ram if profile.emulation_blocker(gt) is None else None
+        res = oracle_allocsize.check(gt, finding.address, profile.cwe789_stack_threshold,
+                                     stack_size=ram.size if ram else None)
+        return record(res.verdict, res.confidence, EngineTier.C_STATIC_ONLY, "allocsize", res.detail,
+                      notes="" if res.verdict != Verdict.INCONCLUSIVE else "Needs manual review.")
 
-    if finding.cwe_id in ("CWE-121", "CWE-125", "CWE-787"):
-        if not is_cortexm_target:
-            return VerdictRecord(
-                finding_id=finding.finding_id,
-                verdict=Verdict.INCONCLUSIVE,
-                confidence="low",
-                engine_tier=EngineTier.C_STATIC_ONLY,
-                evidence=Evidence(kind="recovery",
-                                   detail="Binary does not match the bare-metal "
-                                          "Cortex-M vector-table memory layout "
-                                          "this tool's emulation harness assumes "
-                                          "(isr_vector[0]/[1] do not resolve to a "
-                                          "plausible initial SP + matching Reset_Handler). "
-                                          "No dynamic verification capability for "
-                                          "this target/arch."),
-                notes="Manual review required: this target needs a dedicated "
-                      "memory-map/harness profile before dynamic verification is "
-                      "possible.",
-            )
+    if finding.cwe_id in oracle_bounds.READ_CWES | oracle_bounds.WRITE_CWES:
+        blocker = profile.emulation_blocker(gt)
+        if blocker is not None:
+            return record(Verdict.INCONCLUSIVE, "low", EngineTier.C_STATIC_ONLY, "recovery",
+                          f"Not emulated: {blocker} (target profile: {profile.source}). {r.detail}",
+                          notes="Needs a target profile (--target) describing this image's memory "
+                                "map, or manual review.")
 
         func = gt.function_at(finding.address)
         if func is None:
-            return VerdictRecord(
-                finding_id=finding.finding_id,
-                verdict=Verdict.INCONCLUSIVE,
-                confidence="low",
-                engine_tier=EngineTier.A_FULL_DYNAMIC,
-                evidence=Evidence(kind="reachability", detail=r.detail),
-                notes="The flagged address does not fall inside any known function's "
-                      "boundary -- cannot select a driving strategy or a candidate "
-                      "variable. Needs manual review.",
-            )
+            return record(Verdict.INCONCLUSIVE, "low", EngineTier.A_FULL_DYNAMIC, "reachability", r.detail,
+                          notes="The flagged address is not inside any known function, so there is "
+                                "no function to drive or frame to check. Needs manual review.")
+        return _run_generic_dynamic_check(gt, profile, finding, func)
 
-        return _run_generic_dynamic_check(gt, finding, func)
-
-    return VerdictRecord(
-        finding_id=finding.finding_id,
-        verdict=Verdict.INCONCLUSIVE,
-        confidence="low",
-        engine_tier=EngineTier.C_STATIC_ONLY,
-        evidence=Evidence(kind="recovery",
-                           detail=f"No verification oracle implemented for {finding.cwe_id} in this MVP."),
-        notes="Unsupported CWE class -- needs manual review.",
-    )
+    return record(Verdict.INCONCLUSIVE, "low", EngineTier.C_STATIC_ONLY, "recovery",
+                  f"No verification oracle is implemented for {finding.cwe_id}. {r.detail}",
+                  notes="Unsupported CWE class; needs manual review.")
 
 
-def run(binary_path: str, findings) -> list:
+def run(binary_path: str, findings, profile: Optional[target.TargetProfile] = None) -> list:
     gt = elfinfo.load(binary_path)
-    return [adjudicate(gt, f) for f in findings]
+    resolved = target.resolve(gt, profile)
+    return [adjudicate(gt, f, resolved) for f in findings]

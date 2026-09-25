@@ -17,7 +17,10 @@
 
 #include <stdint.h>
 
+/* Overridable so fixture 12 can place the UART where an STM32 has it. */
+#ifndef UART0_BASE
 #define UART0_BASE 0x40001000UL
+#endif
 
 typedef struct {
     volatile uint32_t SR;
@@ -26,8 +29,12 @@ typedef struct {
 
 #define UART0 ((UART_TypeDef *)UART0_BASE)
 
+#ifndef UART_SR_TXE
 #define UART_SR_TXE  (1U << 0)
+#endif
+#ifndef UART_SR_RXNE
 #define UART_SR_RXNE (1U << 1)
+#endif
 
 #define SIM_BASE 0x40002000UL
 

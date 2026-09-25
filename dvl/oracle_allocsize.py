@@ -1,27 +1,22 @@
 """
-CWE-789 ("Memory Allocation with Excessive Size Value") verification oracle.
+CWE-789 ("Memory Allocation with Excessive Size Value") oracle, static.
 
-Two distinct refutation strategies live here, both static (no emulation
-needed -- this CWE is about the *size operand's provenance*, not a
-runtime memory-safety violation an access trace could catch):
+cwe_checker raises CWE-789 for a stack allocation whose size exceeds a
+threshold (7500 bytes by default), so the question for a flagged
+`sub sp, sp, #N` is simply whether N exceeds that threshold:
 
-1. Constant-immediate proof (fixture 02): if the flagged instruction (or
-   the function's own prologue `sub sp, sp, #imm`) encodes its size as a
-   literal immediate operand, that is a compile-time constant by
-   construction -- no taint from any input can reach it, so CWE-789
-   (which is fundamentally about attacker/input-controlled allocation
-   size) cannot hold, regardless of what any emulated input is fed.
+  - N above the threshold: TP (medium). The allocation the finding
+    describes is really there; whether it exhausts the stack depends on
+    how much stack the target has, which is noted when known.
+  - N at or below it: FP (high). The upstream tool mis-sized or
+    mis-decoded the instruction.
+  - a register-sized allocation: Inconclusive (needs taint analysis).
+  - not a stack allocation at all: Inconclusive. The flagged address is
+    probably wrong (e.g. decoded in the wrong ARM/Thumb mode upstream),
+    which says nothing about whether a real allocation nearby is too big.
 
-2. Instruction-identity re-validation (the real-world sample): per the
-   prompt's "Known Hard Problems" -- function boundary / mode-detection
-   errors upstream produce garbage answers even when our own downstream
-   logic is correct. Before trusting that a flagged address is even an
-   allocation instruction at all, re-disassemble it ourselves (using our
-   own ELF-mapping-symbol-derived ARM/Thumb mode, not whatever the
-   upstream tool assumed). If it isn't a stack-pointer-adjusting
-   instruction at all (e.g. it's a conditional branch), the finding is
-   invalid on its face: CWE-789 cannot apply to an instruction that
-   doesn't allocate anything.
+The instruction is re-disassembled here in the mode the ELF's mapping
+symbols give, not the mode the upstream tool assumed.
 """
 from __future__ import annotations
 
@@ -41,8 +36,6 @@ class AllocSizeResult:
     confidence: str = "high"
 
 
-_SP_REGS = {"sp"}
-
 
 def _disasm_one(gt: ElfGroundTruth, addr: int):
     data = gt.read_bytes(addr, 8)
@@ -59,67 +52,46 @@ def _disasm_one(gt: ElfGroundTruth, addr: int):
     return None
 
 
-def check(gt: ElfGroundTruth, address: int) -> AllocSizeResult:
+def check(gt: ElfGroundTruth, address: int, stack_threshold: int,
+          stack_size: Optional[int] = None) -> AllocSizeResult:
+    mode = gt.mode_at(address)
     insn = _disasm_one(gt, address)
     if insn is None:
         return AllocSizeResult(
-            verdict=Verdict.INCONCLUSIVE,
-            detail=(f"Could not disassemble any instruction at 0x{address:x} using "
-                     f"our own ELF-mapping-symbol-derived mode ('{gt.mode_at(address)}') "
-                     f"-- insufficient evidence to confirm or refute this finding."),
-            confidence="low",
-        )
+            verdict=Verdict.INCONCLUSIVE, confidence="low",
+            detail=(f"Could not disassemble an instruction at 0x{address:x} in mode '{mode}' "
+                    f"(from the ELF's mapping symbols)."))
 
-    mnem = insn.mnemonic.lower()
-    ops = insn.op_str.lower().replace(" ", "")
-
-    is_sp_adjust = mnem.startswith(("sub", "add")) and "sp" in ops.split(",")[0:1] or \
-                   (mnem.startswith(("sub", "add")) and ops.startswith("sp,"))
-
-    if not is_sp_adjust:
+    text = f"{insn.mnemonic} {insn.op_str}"
+    ops = [o.strip() for o in insn.op_str.lower().split(",")]
+    is_alloc = insn.mnemonic.lower().startswith("sub") and ops[:1] == ["sp"]
+    if not is_alloc:
         return AllocSizeResult(
-            verdict=Verdict.FP,
-            detail=(f"Re-disassembled independently (mode='{gt.mode_at(address)}', derived "
-                     f"from ELF mapping symbols, not the upstream tool's assumption): the "
-                     f"flagged address 0x{address:x} decodes to '{insn.mnemonic} {insn.op_str}', "
-                     f"NOT a stack-pointer-adjusting instruction. CWE-789 (excessive "
-                     f"allocation size) cannot apply to an instruction that does not "
-                     f"allocate anything -- this is exactly the 'function boundary / mode "
-                     f"detection' failure mode called out for bare-metal SAST pipelines: "
-                     f"the upstream tool's own disassembly window shows a mismatch between "
-                     f"the description's referenced address and the flagged instruction, "
-                     f"and/or a Thumb/ARM mode error caused it to point at the wrong byte "
-                     f"entirely."),
-            confidence="high",
-        )
+            verdict=Verdict.INCONCLUSIVE, confidence="low",
+            detail=(f"Re-disassembled in mode '{mode}' (from the ELF's mapping symbols), 0x{address:x} "
+                    f"is '{text}', not a stack allocation. The upstream address or ARM/Thumb mode is "
+                    f"likely wrong, which neither confirms nor refutes an excessive allocation nearby."))
 
-    # It IS a sp-adjusting instruction. Is the size operand a literal
-    # immediate ("#N") or a register (tainted, needs real dataflow analysis
-    # we don't attempt here)?
+    imm = None
     if "#" in insn.op_str:
-        imm_str = insn.op_str.split("#", 1)[1].split(",")[0].strip()
         try:
-            imm = int(imm_str, 16) if imm_str.lower().startswith("0x") else int(imm_str)
+            imm = int(insn.op_str.split("#", 1)[1].split(",")[0].strip(), 0)
         except ValueError:
             imm = None
+    if imm is None:
         return AllocSizeResult(
-            verdict=Verdict.FP,
-            detail=(f"'{insn.mnemonic} {insn.op_str}' at 0x{address:x} adjusts sp by a "
-                     f"literal immediate{f' (0x{imm:x} / {imm} bytes)' if imm is not None else ''} "
-                     f"encoded directly in the instruction. This is a compile-time constant "
-                     f"by construction -- no register/memory taint from any input can reach "
-                     f"an immediate operand, so CWE-789 (attacker/input-controlled excessive "
-                     f"allocation size) cannot hold here regardless of what value emulation "
-                     f"would otherwise feed as input."),
-            confidence="high",
-        )
+            verdict=Verdict.INCONCLUSIVE, confidence="low",
+            detail=(f"'{text}' at 0x{address:x} sizes the stack allocation from a register; "
+                    f"confirming or refuting needs dataflow/taint analysis back to its origin."))
 
+    stack_note = (f" The target has at most {stack_size} bytes of RAM for its stack." if stack_size else "")
+    if imm > stack_threshold:
+        return AllocSizeResult(
+            verdict=Verdict.TP, confidence="medium",
+            detail=(f"'{text}' at 0x{address:x} allocates {imm} bytes of stack in one step, above "
+                    f"the {stack_threshold}-byte threshold.{stack_note}"))
     return AllocSizeResult(
-        verdict=Verdict.INCONCLUSIVE,
-        detail=(f"'{insn.mnemonic} {insn.op_str}' at 0x{address:x} adjusts sp using a "
-                 f"register operand, not a literal immediate -- its value could in "
-                 f"principle be influenced by tainted input. Confirming or refuting this "
-                 f"requires dataflow/taint analysis back to the register's origin, which "
-                 f"this oracle does not attempt; flagging for manual review."),
-        confidence="low",
-    )
+        verdict=Verdict.FP, confidence="high",
+        detail=(f"'{text}' at 0x{address:x} allocates a constant {imm} bytes of stack, at or below "
+                f"the {stack_threshold}-byte threshold (mode '{mode}', from the ELF's mapping "
+                f"symbols).{stack_note}"))

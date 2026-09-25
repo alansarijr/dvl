@@ -43,7 +43,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .elfinfo import ElfGroundTruth
-from .mmio import PERIPH_BASE, UART0_SR, UART0_DR, UART_SR_TXE, UART_SR_RXNE
+from .emulator_cortexm import SEED_STACK_HEADROOM
+from .target import TargetProfile
 
 LR_SENTINEL = 0xFFFFFFFE
 
@@ -70,7 +71,7 @@ def _fault_avoid_addrs(gt: ElfGroundTruth) -> set:
     return addrs
 
 
-def solve_driving_input(gt: ElfGroundTruth, root_addr: int, target_addr: int,
+def solve_driving_input(gt: ElfGroundTruth, profile: TargetProfile, root_addr: int, target_addr: int,
                          extra_avoid_addrs: Optional[set] = None,
                          prefix_bytes: int = 4,
                          suffix_bytes: int = 32,
@@ -101,8 +102,9 @@ def solve_driving_input(gt: ElfGroundTruth, root_addr: int, target_addr: int,
     except Exception:
         return None
 
-    uart0_sr_abs = PERIPH_BASE + UART0_SR
-    uart0_dr_abs = PERIPH_BASE + UART0_DR
+    uart = profile.uart
+    sr_addr = uart.status_addr if uart else None
+    dr_addr = uart.data_addr if uart else None
     stream_len = prefix_bytes + suffix_bytes + 1   # prefix + filler + '\n'
 
     def mem_read_hook(state):
@@ -114,10 +116,10 @@ def solve_driving_input(gt: ElfGroundTruth, root_addr: int, target_addr: int,
         width = attrs.mem_read_length * 8
         n = state.globals.get("uart_n", 0)
 
-        if addr_c == uart0_sr_abs:
-            rxne = UART_SR_RXNE if n < stream_len else 0
-            attrs.mem_read_expr = claripy.BVV(UART_SR_TXE | rxne, width)
-        elif addr_c == uart0_dr_abs:
+        if addr_c == sr_addr:
+            rxne = uart.rxne if n < stream_len else 0
+            attrs.mem_read_expr = claripy.BVV(uart.txe | rxne, width)
+        elif addr_c == dr_addr:
             if n >= stream_len:
                 attrs.mem_read_expr = claripy.BVV(0, width)
                 return
@@ -137,7 +139,7 @@ def solve_driving_input(gt: ElfGroundTruth, root_addr: int, target_addr: int,
                          angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS})
         args = tuple(claripy.BVS(f"arg{i}", 32) for i in range(4))
         state.regs.r0, state.regs.r1, state.regs.r2, state.regs.r3 = args
-        state.regs.sp = 0x20000000 + 0x00010000 - 0x400
+        state.regs.sp = profile.stack_top - SEED_STACK_HEADROOM   # as the Unicorn replay seeds it
         state.regs.lr = LR_SENTINEL
         state.inspect.b("mem_read", when=angr.BP_AFTER, action=mem_read_hook)
 

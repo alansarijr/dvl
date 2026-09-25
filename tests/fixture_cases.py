@@ -7,11 +7,12 @@ from pathlib import Path
 
 import capstone as cs
 
-from dvl import elfinfo
+from dvl import elfinfo, target
 from dvl.schema import AddressSpace, Finding
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = ROOT / "fixtures" / "baremetal"
+FIXTURE_PROFILE = ROOT / "targets" / "dvl-fixtures.toml"
 
 
 @functools.lru_cache(maxsize=None)
@@ -24,8 +25,16 @@ def all_cases() -> list:
     for exp_path in sorted(FIXTURES_DIR.glob("*/expected.json")):
         expected = json.loads(exp_path.read_text())
         for case in expected["cases"]:
+            case.setdefault("target", expected.get("target"))
             cases.append((exp_path.parent, case))
     return cases
+
+
+def load_profile(fixture_dir: Path, case: dict) -> target.TargetProfile:
+    """The fixture's own profile ("target" in expected.json, relative to the
+    fixture) or the shared one for the synthetic fixture board."""
+    path = fixture_dir / case["target"] if case.get("target") else FIXTURE_PROFILE
+    return target.load(str(path))
 
 
 def case_id(fixture_dir: Path, case: dict) -> str:

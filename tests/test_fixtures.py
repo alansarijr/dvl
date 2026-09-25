@@ -5,7 +5,7 @@ import pytest
 from dvl import pipeline
 from dvl.schema import Verdict
 
-from fixture_cases import all_cases, build_finding, case_id
+from fixture_cases import all_cases, build_finding, case_id, load_profile
 
 
 def _params():
@@ -23,7 +23,7 @@ def _params():
 @pytest.mark.parametrize("fixture_dir, case", _params())
 def test_fixture_case(fixture_dir, case):
     gt, finding = build_finding(fixture_dir, case)
-    record = pipeline.adjudicate(gt, finding)
+    record = pipeline.adjudicate(gt, finding, load_profile(fixture_dir, case))
 
     detail = f"[{record.engine_tier.value}/{record.evidence.kind}] {record.evidence.detail}"
     assert record.verdict == Verdict(case["expected_verdict"]), detail

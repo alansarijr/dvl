@@ -22,25 +22,29 @@ from typing import Optional
 from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UcError
 from unicorn.arm_const import (
     UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
+    UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
+    UC_ARM_REG_R8, UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11,
     UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_PC,
 )
 from unicorn.unicorn_const import (
     UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UC_HOOK_MEM_READ, UC_MEM_WRITE,
+    UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED, UC_MEM_WRITE_UNMAPPED,
 )
 
-from .callgraph import idle_addresses
+from . import target
+from .callgraph import RETURN, classify_branch, decode_one, idle_addresses
 from .elfinfo import ElfGroundTruth
 from .mmio import MmioModel, install as mmio_install
 
-FLASH_BASE = 0x00000000
-FLASH_SIZE = 0x00040000     # 256K, matches linker.ld
-RAM_BASE = 0x20000000
-RAM_SIZE = 0x00010000        # 64K, matches linker.ld
+SEED_STACK_HEADROOM = 0x400  # below the stack top, for runs seeded at a function
 
 LR_SENTINEL = 0xFFFFFFFE     # unmapped; landing here on return = "function returned"
-DEFAULT_MAX_INSTRUCTIONS = 2_000_000
 EXCEPTION_FRAME_BYTES = 32   # r0-r3, r12, lr, pc, xpsr stacked by hardware on exception entry
 SAVED_LR_SEARCH_BYTES = 64   # push {r4-r11, lr} is the widest prologue save
+MAX_HIJACK_RECOVERIES = 16
+GUARD_BYTES = 0x10000        # mapped above RAM so an overflow off its end is recorded, not fatal
+_CALLEE_SAVED = (UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
+                 UC_ARM_REG_R8, UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11)
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,7 @@ class Frame:
     cfa: int           # SP at entry == DWARF CFA
     ret: int           # return address (LR at entry, Thumb bit cleared)
     lr: int = 0        # raw LR at entry, as the prologue will push it
+    callee_saved: tuple = ()   # r4-r11 at entry, restored if a smashed return is recovered
 
 
 @dataclass
@@ -60,6 +65,7 @@ class MemAccess:
     is_write: bool
     value: Optional[int] = None
     frames: tuple = ()      # live Frame stack at access time, outermost first
+    unmapped: bool = False  # the access hit no mapped memory (the run faulted on it)
 
     def frame_of(self, func_addr: int) -> Optional[Frame]:
         """Innermost live activation of func_addr, if any."""
@@ -79,7 +85,9 @@ class RunResult:
     accesses: list = field(default_factory=list)          # list[MemAccess], cumulative across runs
     watch_hits: dict = field(default_factory=dict)        # watched addr -> times executed
     saved_lr_slots: dict = field(default_factory=dict)    # activation -> address its prologue pushed LR to
+    profile: Optional[target.TargetProfile] = None
     fault_target: Optional[int] = None                    # PC value execution faulted trying to fetch
+    recoveries: list = field(default_factory=list)        # smashed returns the harness repaired to keep going
     exit_code: Optional[int] = None
 
     @property
@@ -92,7 +100,7 @@ class RunResult:
         program's only possible behavior: code it never executed cannot
         execute under any input this harness can supply."""
         return (self.stopped_reason in ("sim_exit", "returned", "idle")
-                and self.input_consumed == 0
+                and self.input_consumed == 0 and not self.recoveries
                 and not (self.mmio and self.mmio.poll_break_log))
 
 
@@ -101,14 +109,16 @@ class CortexM3Harness:
     repeatedly on the same instance (reset, then one call per simulated
     interrupt); RAM and the access log persist across calls."""
 
-    def __init__(self, gt: ElfGroundTruth):
+    def __init__(self, gt: ElfGroundTruth, profile: Optional[target.TargetProfile] = None):
         self.gt = gt
+        self.profile = profile if profile is not None and profile.resolved else target.resolve(gt, profile)
         self.uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB)
-        self.mmio = MmioModel()
+        self.mmio = MmioModel.for_profile(self.profile)
+        self._guard: tuple = (0, 0)
         self._setup_memory()
-        mmio_install(self.uc, self.mmio)
+        mmio_install(self.uc, self.mmio, self.profile)
         self._instr_count = 0
-        self._max_instructions = DEFAULT_MAX_INSTRUCTIONS
+        self._max_instructions = self.profile.instruction_budget
         self._accesses: list = []
         self._monitor_ranges: list = []     # list[(lo,hi)] restrict access-trace collection (perf)
         self._stop_reason = None
@@ -124,22 +134,40 @@ class CortexM3Harness:
         self._rets: Counter = Counter()
         self._activations = itertools.count(1)
         self._lr_slots: dict = {}
+        self._recoveries: list = []
         # Registered once per instance: registering per run_from() call would
         # stack duplicate callbacks and multiply-count every access.
         self.uc.hook_add(UC_HOOK_CODE, self._code_hook)
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self._mem_hook)
         self.uc.hook_add(UC_HOOK_MEM_READ, self._mem_hook)
+        self.uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED, self._unmapped_hook)
 
     def _setup_memory(self):
-        self.uc.mem_map(FLASH_BASE, FLASH_SIZE)
-        self.uc.mem_map(RAM_BASE, RAM_SIZE)
+        for r in self.profile.regions:
+            lo = r.base & ~(target.PAGE - 1)
+            hi = (r.end + target.PAGE - 1) & ~(target.PAGE - 1)
+            self.uc.mem_map(lo, hi - lo)
+        # Past the end of RAM, real hardware bus-faults. Mapping a guard
+        # there lets the run continue past a stack overflow that runs off
+        # the top (accesses to it are marked unmapped for the oracles), so
+        # one crash does not hide every later finding.
+        ram = self.profile.ram
+        if ram is not None:
+            g_lo = (ram.end + target.PAGE - 1) & ~(target.PAGE - 1)
+            g_hi = g_lo + GUARD_BYTES
+            if not any(r.base < g_hi and g_lo < r.end for r in self.profile.regions):
+                try:
+                    self.uc.mem_map(g_lo, GUARD_BYTES)
+                    self._guard = (g_lo, g_hi)
+                except UcError:
+                    pass
         # load_images puts initialized data at its flash (LMA) address too,
         # where the reset handler's .data copy loop reads it from.
         for addr, data in list(self.gt.load_images) + list(self.gt.segments):
-            if FLASH_BASE <= addr < FLASH_BASE + FLASH_SIZE:
-                self.uc.mem_write(addr, bytes(data))
-            elif RAM_BASE <= addr < RAM_BASE + RAM_SIZE:
-                self.uc.mem_write(addr, bytes(data))
+            for r in self.profile.regions:
+                lo, hi = max(addr, r.base), min(addr + len(data), r.end)
+                if lo < hi:
+                    self.uc.mem_write(lo, bytes(data[lo - addr:hi - addr]))
 
     def set_input_queue(self, data: bytes):
         self.mmio.load_input(data)
@@ -188,7 +216,7 @@ class CortexM3Harness:
             self._pop_returned(sp)
             lr = uc.reg_read(UC_ARM_REG_LR)
             frame = Frame(func=address, activation=next(self._activations), cfa=sp,
-                          ret=lr & ~1, lr=lr)
+                          ret=lr & ~1, lr=lr, callee_saved=tuple(uc.reg_read(r) for r in _CALLEE_SAVED))
             self._stack.append(frame)
             self._rets[frame.ret] += 1
             self._live = tuple(self._stack)
@@ -200,6 +228,9 @@ class CortexM3Harness:
         if self._monitor_ranges and not any(lo <= address < hi for lo, hi in self._monitor_ranges):
             return
         is_write = access == UC_MEM_WRITE
+        if self._guard[0] <= address < self._guard[1]:
+            self._unmapped_hook(uc, UC_MEM_WRITE_UNMAPPED if is_write else 0, address, size, value, None)
+            return
         if is_write and self._stack:
             top = self._stack[-1]
             # The prologue's push stores LR just below the CFA: remember
@@ -211,6 +242,13 @@ class CortexM3Harness:
             pc=self._pc, address=address, size=size, is_write=is_write,
             value=value if is_write else None, frames=self._live))
 
+    def _unmapped_hook(self, uc, access, address, size, value, user_data):
+        is_write = access == UC_MEM_WRITE_UNMAPPED
+        self._accesses.append(MemAccess(
+            pc=self._pc, address=address, size=size, is_write=is_write,
+            value=value if is_write else None, frames=self._live, unmapped=True))
+        return False   # let Unicorn raise the fault
+
     # -- running -------------------------------------------------------------
 
     def run_from(self, entry_addr: int, sp: Optional[int] = None,
@@ -219,9 +257,11 @@ class CortexM3Harness:
         """Execute Thumb code at entry_addr until it returns to the LR
         sentinel, exits via the SIM register, faults, exhausts the budget,
         or (with stop_at_idle) reaches a wfi/wfe or branch-to-self loop.
-        sp defaults to near the top of RAM."""
+        sp defaults to the vector table's initial SP for a run from the
+        reset handler, and to just below the stack top otherwise."""
         if sp is None:
-            sp = RAM_BASE + RAM_SIZE - 0x400   # leave headroom below top of RAM
+            top = self.profile.stack_top
+            sp = top if entry_addr == self.gt.entry else top - SEED_STACK_HEADROOM
 
         self.uc.reg_write(UC_ARM_REG_SP, sp)
         self.uc.reg_write(UC_ARM_REG_LR, LR_SENTINEL)
@@ -240,15 +280,23 @@ class CortexM3Harness:
         self._set_stack([])
 
         fault_pc = fault_target = None
-        try:
-            # entry_addr | 1 forces Thumb state for the initial branch.
-            self.uc.emu_start(entry_addr | 1, LR_SENTINEL)
-        except UcError as e:
-            if not self.mmio.sim_exit_requested:
+        start = entry_addr | 1   # forces Thumb state for the initial branch
+        while True:
+            try:
+                self.uc.emu_start(start, LR_SENTINEL)
+                break
+            except UcError as e:
+                if self.mmio.sim_exit_requested:
+                    break
+                target_pc = self.uc.reg_read(UC_ARM_REG_PC)
+                if self._recover_from_hijack(target_pc):
+                    start = self.uc.reg_read(UC_ARM_REG_PC) | 1
+                    continue
                 self._stop_reason = "fault"
                 self._fault_detail = str(e)
                 fault_pc = self._pc
-                fault_target = self.uc.reg_read(UC_ARM_REG_PC)
+                fault_target = target_pc
+                break
 
         if self._stop_reason is None:
             if self.mmio.sim_exit_requested:
@@ -270,8 +318,36 @@ class CortexM3Harness:
             watch_hits=dict(self._watch_hits),
             saved_lr_slots=dict(self._lr_slots),
             fault_target=fault_target,
+            recoveries=list(self._recoveries),
+            profile=self.profile,
             exit_code=self.mmio.sim_exit_code,
         )
+
+    def _recover_from_hijack(self, target_pc: int) -> bool:
+        """A return through a smashed saved LR sends execution to garbage and
+        ends the run, hiding every later finding. When the faulting
+        instruction was the innermost frame's return, finish that return the
+        way the intact frame would have (callee-saved registers, SP and PC
+        from its entry) and keep going. Evidence of the smash itself is
+        already in the access trace."""
+        if not self._stack or len(self._recoveries) >= MAX_HIJACK_RECOVERIES:
+            return False
+        frame = self._stack[-1]
+        if (target_pc & ~1) == frame.ret:
+            return False
+        insn = decode_one(self.gt, self._pc)
+        if insn is None or classify_branch(insn) != RETURN:
+            return False
+        for reg, value in zip(_CALLEE_SAVED, frame.callee_saved):
+            self.uc.reg_write(reg, value)
+        self.uc.reg_write(UC_ARM_REG_SP, frame.cfa)
+        self.uc.reg_write(UC_ARM_REG_PC, frame.ret | 1)
+        func = self.gt.function_at(frame.func)
+        self._recoveries.append({"function": func.name if func else hex(frame.func),
+                                 "return_pc": hex(self._pc), "smashed_target": hex(target_pc),
+                                 "resumed_at": hex(frame.ret)})
+        self._pop_returned(frame.cfa)
+        return True
 
     def deliver_irq(self, handler_addr: int) -> RunResult:
         """Run an interrupt handler on top of the current (idle) context,
@@ -279,7 +355,8 @@ class CortexM3Harness:
         frame's worth of stacked registers, with RAM exactly as the
         interrupted code left it."""
         sp = self.uc.reg_read(UC_ARM_REG_SP)
-        if not (RAM_BASE < sp <= RAM_BASE + RAM_SIZE):
-            sp = RAM_BASE + RAM_SIZE - 0x400
+        ram = self.profile.ram
+        if ram is None or not (ram.base < sp <= ram.end):
+            sp = self.profile.stack_top - SEED_STACK_HEADROOM
         sp = (sp - EXCEPTION_FRAME_BYTES) & ~7
         return self.run_from(handler_addr, sp=sp)

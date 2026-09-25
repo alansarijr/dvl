@@ -35,8 +35,8 @@ class EngineTier(str, Enum):
 
     A = full dynamic (emulation available for this arch)
     B = partial dynamic (partial/lower-confidence emulation)
-    C = static-only (no emulator for this arch; refutation only, never a
-        confirmed TP)
+    C = static-only (no emulation involved): reachability refutation, or a
+        CWE whose claim is itself a static fact (CWE-789's allocation size)
     """
     A_FULL_DYNAMIC = "A_full_dynamic"
     B_PARTIAL_DYNAMIC = "B_partial_dynamic"

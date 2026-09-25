@@ -1,5 +1,5 @@
 include ../common/Makefile.inc
 
-all: good.elf
+all: good.elf bad.elf
 
 clean: clean-common

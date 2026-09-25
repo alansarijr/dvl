@@ -1,0 +1,45 @@
+# Target profile for fixtures/baremetal and sample_firmware: the
+# synthetic Cortex-M3 board described by fixtures/baremetal/common/
+# (linker.ld, mmio.h). Memory and vector table are written out here for
+# documentation; leaving them out would derive the same values from the ELF.
+name = "dvl-fixtures"
+
+[[memory]]
+name = "flash"
+kind = "flash"
+base = 0x00000000
+size = 0x00040000
+
+[[memory]]
+name = "ram"
+kind = "ram"
+base = 0x20000000
+size = 0x00010000
+
+[vector_table]
+address = 0x00000000
+
+[[peripheral]]
+name = "periph"
+base = 0x40000000
+size = 0x00010000
+
+[[uart]]
+name = "UART0"
+base = 0x40001000
+status = 0x00   # SR
+data = 0x04     # DR
+rxne = 0x02
+txe = 0x01
+
+# Test-harness registers: writing EXIT ends the run.
+[sim]
+exit = 0x40002000
+print = 0x40002004
+
+[limits]
+instruction_budget = 4000000
+max_plausible_overrun = 4096
+
+[cwe789]
+stack_threshold = 7500

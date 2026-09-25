@@ -1,0 +1,34 @@
+{
+  "fixture": "12_stm32_layout",
+  "target": "target.toml",
+  "description": "Fixtures 01 and 04 rebuilt for an STM32F1-like board (flash at 0x08000000, 128K RAM, USART1 at 0x40013800 with RXNE=bit5/TXE=bit7). The profile only names an SVD file: memory map and vector table must be derived from the ELF, and the UART model from the SVD.",
+  "cases": [
+    {
+      "binary": "overflow.elf",
+      "function": "vulnerable_copy",
+      "line": "bad.c:17",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "expected_confidence": "high",
+      "reason": "Fixture 01's overflow at the STM32 layout."
+    },
+    {
+      "binary": "bad.elf",
+      "function": "handle_command",
+      "line": "bad.c:34",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "expected_confidence": "high",
+      "reason": "Fixture 04's UART-fed overflow; needs the SVD's USART1 model to deliver input."
+    },
+    {
+      "binary": "good.elf",
+      "function": "handle_command_safe",
+      "line": "good.c:21",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "expected_confidence": "high",
+      "reason": "Fixture 04's bounded twin."
+    }
+  ]
+}

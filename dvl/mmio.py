@@ -1,54 +1,38 @@
 """
-Peripheral/MMIO stubbing for the Cortex-M3 bare-metal harness.
+Peripheral/MMIO models for the Cortex-M harness.
 
-Per the prompt's "Known Hard Problems": peripheral/MMIO stubbing is the
-single biggest source of emulation hangs/false-unreachability for
-bare-metal. Two things must both be true for this harness to be useful:
+Peripheral stubbing is the biggest source of emulation hangs and false
+"unreachable" results on bare metal. Two things must hold:
 
- 1. Poll loops on status registers (UART SR.TXE / SR.RXNE) must be
-    broken, or every fixture that ever calls uart_putc()/uart_getc()
-    hangs forever and gets misreported as "unreachable".
- 2. The values fed through data registers (UART DR) must actually vary
-    with each read, or a poll-breaker that unblocks the loop but always
-    returns the same byte can make the loop exit trivially (e.g. on the
-    first read) without ever driving the intended number of iterations,
-    silently hiding a bug that only triggers with a longer input.
+ 1. Status-register poll loops must terminate, or every uart_getc()/
+    uart_putc() hangs forever.
+ 2. Data registers must deliver a real byte stream, or a loop that is
+    unblocked but always reads the same byte can exit early and never
+    drive the iteration count that triggers the bug.
 
-This module implements a per-project *declarative* peripheral model
-(UART0 + SIM test-harness registers, matching fixtures/baremetal/common/
-mmio.h) plus a generic fallback poll-breaker for any other MMIO address
-the fixtures don't know about -- exactly the two stubbing strategies
-called out as open questions in the prompt ("hand-written stubs vs.
-existing emulator peripheral models"); we chose hand-written, since a
-full QEMU peripheral model is out of scope for firmware with a small,
-fixed set of test peripherals.
+The target profile names a UART (status/data offsets, RXNE/TXE masks) that
+serves as the input channel, and optionally the fixtures' SIM exit/print
+registers. Every other mapped peripheral address is served by a generic
+poll-breaker: after a few repeated reads it alternates all-ones and zero,
+so both "wait until set" and "wait until clear" loops make progress.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional
 
-PERIPH_BASE = 0x40000000
-PERIPH_SIZE = 0x10000
+from .target import PAGE, TargetProfile, UartModel
 
-UART0_OFFSET = 0x1000
-UART0_SR = UART0_OFFSET + 0x00
-UART0_DR = UART0_OFFSET + 0x04
-
-SIM_OFFSET = 0x2000
-SIM_EXIT = SIM_OFFSET + 0x00
-SIM_PRINT = SIM_OFFSET + 0x04
-
-UART_SR_TXE = 1 << 0
-UART_SR_RXNE = 1 << 1
-
-GENERIC_POLL_BREAK_THRESHOLD = 8   # reads of an unmodeled address before we force a bit
-INPUT_STARVED_THRESHOLD = 2000     # UART SR polls with an empty RX queue before the run is stopped
+GENERIC_POLL_BREAK_THRESHOLD = 8   # reads of an unmodeled address before it starts toggling
+INPUT_STARVED_THRESHOLD = 2000     # UART status polls with an empty RX queue before the run is stopped
 
 
 @dataclass
 class MmioModel:
-    """Stateful peripheral model, one instance per emulation run."""
+    """Stateful peripheral model, one instance per harness."""
+    uart: Optional[UartModel] = None
+    sim_exit: Optional[int] = None
+    sim_print: Optional[int] = None
     input_queue: bytearray = field(default_factory=bytearray)
     rx_pos: int = 0
     tx_bytes: bytearray = field(default_factory=bytearray)
@@ -57,8 +41,12 @@ class MmioModel:
     sim_exit_code: Optional[int] = None
     read_counts: dict = field(default_factory=dict)     # generic-fallback poll counters
     sr_read_count_since_last_rx: int = 0
-    poll_break_log: list = field(default_factory=list)   # audit trail of poll-breaks applied
+    poll_break_log: list = field(default_factory=list)   # addresses the generic poll-breaker forced
     starved: bool = False    # firmware is spinning on RXNE and the input queue is empty
+
+    @classmethod
+    def for_profile(cls, profile: TargetProfile) -> "MmioModel":
+        return cls(uart=profile.uart, sim_exit=profile.sim_exit, sim_print=profile.sim_print)
 
     def load_input(self, data: bytes):
         self.input_queue = bytearray(data)
@@ -67,17 +55,17 @@ class MmioModel:
     def rx_available(self) -> bool:
         return self.rx_pos < len(self.input_queue)
 
-    def read(self, offset: int, size: int) -> int:
-        if offset == UART0_SR:
-            txe = UART_SR_TXE  # transmit never blocks in this harness
-            rxne = UART_SR_RXNE if self.rx_available() else 0
-            if not self.rx_available():
-                self.sr_read_count_since_last_rx += 1
-                if self.sr_read_count_since_last_rx >= INPUT_STARVED_THRESHOLD:
-                    self.starved = True
-            return txe | rxne
+    def read(self, addr: int, size: int) -> int:
+        u = self.uart
+        if u is not None and addr == u.status_addr:
+            if self.rx_available():
+                return u.txe | u.rxne
+            self.sr_read_count_since_last_rx += 1
+            if self.sr_read_count_since_last_rx >= INPUT_STARVED_THRESHOLD:
+                self.starved = True
+            return u.txe
 
-        if offset == UART0_DR:
+        if u is not None and addr == u.data_addr:
             if self.rx_available():
                 b = self.input_queue[self.rx_pos]
                 self.rx_pos += 1
@@ -85,50 +73,63 @@ class MmioModel:
                 return b
             return 0
 
-        # Generic fallback poll-breaker for any address we don't have a
-        # declarative model for: after enough repeated reads, start
-        # forcing all-bits-set so a "wait until bit X set" loop can make
-        # progress instead of spinning forever.
-        self.read_counts[offset] = self.read_counts.get(offset, 0) + 1
-        if self.read_counts[offset] > GENERIC_POLL_BREAK_THRESHOLD:
-            self.poll_break_log.append(
-                {"offset": hex(offset), "reads": self.read_counts[offset],
-                 "action": "forced_all_bits_set"}
-            )
-            return (1 << (size * 8)) - 1
-        return 0
+        n = self.read_counts.get(addr, 0) + 1
+        self.read_counts[addr] = n
+        if n <= GENERIC_POLL_BREAK_THRESHOLD:
+            return 0
+        if n == GENERIC_POLL_BREAK_THRESHOLD + 1:
+            self.poll_break_log.append({"address": hex(addr), "action": "toggle_all_bits"})
+        return (1 << (size * 8)) - 1 if n % 2 else 0
 
-    def write(self, offset: int, size: int, value: int):
-        if offset == UART0_DR:
+    def write(self, addr: int, size: int, value: int):
+        if self.uart is not None and addr == self.uart.tx_data_addr:
             self.tx_bytes.append(value & 0xFF)
-            return
-        if offset == SIM_EXIT:
+        elif addr == self.sim_exit:
             self.sim_exit_requested = True
             self.sim_exit_code = value
-            return
-        if offset == SIM_PRINT:
+        elif addr == self.sim_print:
             self.debug_print.append(value & 0xFF)
-            return
-        # unmodeled peripheral write: ignored (no side effect modeled)
+        # other peripheral writes have no modeled side effect
 
 
-def install(uc, model: MmioModel):
-    """Wire the MmioModel into a Unicorn instance via mmio_map -- fully
-    virtualized reads/writes, no backing RAM needed for the periph
-    region."""
+def mmio_windows(profile: TargetProfile) -> list:
+    """Page-aligned, merged (base, size) windows covering every peripheral
+    range plus the UART and SIM registers, minus anything that overlaps
+    flash or RAM."""
+    spans = [(b, b + s) for _, b, s in profile.peripherals]
+    for addr in (profile.sim_exit, profile.sim_print,
+                 profile.uart.status_addr if profile.uart else None,
+                 profile.uart.data_addr if profile.uart else None):
+        if addr is not None:
+            spans.append((addr, addr + 4))
+    spans = sorted((lo & ~(PAGE - 1), (hi + PAGE - 1) & ~(PAGE - 1)) for lo, hi in spans)
+    merged = []
+    for lo, hi in spans:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return [(lo, hi - lo) for lo, hi in merged
+            if not any(r.base < hi and lo < r.end for r in profile.regions)]
 
-    def read_cb(uc_, offset, size, user_data):
-        value = model.read(offset, size)
-        if model.starved:
-            # Waiting forever for input that will never come.
-            uc_.emu_stop()
-        return value
 
-    def write_cb(uc_, offset, size, value, user_data):
-        model.write(offset, size, value)
-        if offset == SIM_EXIT:
-            # sim_exit() spins after the write; without stopping here every
-            # "exited" run burns the rest of the instruction budget.
-            uc_.emu_stop()
+def install(uc, model: MmioModel, profile: TargetProfile):
+    """Map the peripheral windows into Unicorn with fully virtualized
+    reads/writes (no backing RAM)."""
+    for base, size in mmio_windows(profile):
+        def read_cb(uc_, offset, sz, user_data, base=base):
+            value = model.read(base + offset, sz)
+            if model.starved:
+                # Waiting forever for input that will never come.
+                uc_.emu_stop()
+            return value
 
-    uc.mmio_map(PERIPH_BASE, PERIPH_SIZE, read_cb, None, write_cb, None)
+        def write_cb(uc_, offset, sz, value, user_data, base=base):
+            addr = base + offset
+            model.write(addr, sz, value)
+            if addr == model.sim_exit:
+                # sim_exit() spins after the write; stop here instead of
+                # burning the rest of the instruction budget.
+                uc_.emu_stop()
+
+        uc.mmio_map(base, size, read_cb, None, write_cb, None)
