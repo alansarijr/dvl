@@ -8,8 +8,7 @@
       "line": "bad.c:18",
       "cwe": "CWE-121",
       "expected_verdict": "TP",
-      "reason": "mem_copy writes 64 bytes into buf[16]; the handler runs via handlers[0].",
-      "xfail": "point 1: address-taken functions are not reachability roots yet"
+      "reason": "mem_copy writes 64 bytes into buf[16]; the handler runs via handlers[0]."
     },
     {
       "binary": "good.elf",

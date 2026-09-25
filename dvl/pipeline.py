@@ -235,6 +235,19 @@ def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, fun
 def adjudicate(gt: elfinfo.ElfGroundTruth, finding: Finding) -> VerdictRecord:
     is_cortexm_target = _looks_like_cortexm_fixture_target(gt)
 
+    # Static reachability is valid for any ARM image and any CWE: code that
+    # cannot run cannot be a true positive.
+    r = oracle_reachability.check(gt, finding.address)
+    if r.verdict == Verdict.FP:
+        return VerdictRecord(
+            finding_id=finding.finding_id,
+            verdict=Verdict.FP,
+            confidence=r.confidence,
+            engine_tier=EngineTier.C_STATIC_ONLY,
+            evidence=Evidence(kind="reachability", detail=r.detail, extra=r.facts),
+            notes="Refuted by static reachability triage; emulation was not necessary.",
+        )
+
     if finding.cwe_id == "CWE-789":
         # Pure static instruction-identity / constant-immediate check --
         # valid for ANY arch/target, needs no emulation at all.
@@ -269,18 +282,6 @@ def adjudicate(gt: elfinfo.ElfGroundTruth, finding: Finding) -> VerdictRecord:
                 notes="Manual review required: this target needs a dedicated "
                       "memory-map/harness profile before dynamic verification is "
                       "possible.",
-            )
-
-        r = oracle_reachability.check(gt, finding.address)
-        if r.verdict == Verdict.FP:
-            return VerdictRecord(
-                finding_id=finding.finding_id,
-                verdict=Verdict.FP,
-                confidence="high",
-                engine_tier=EngineTier.A_FULL_DYNAMIC,
-                evidence=Evidence(kind="reachability", detail=r.detail),
-                notes="Refuted by static reachability triage -- emulation "
-                      "was not necessary.",
             )
 
         func = gt.function_at(finding.address)

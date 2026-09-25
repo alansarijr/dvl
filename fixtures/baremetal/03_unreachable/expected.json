@@ -11,6 +11,15 @@
       "expected_confidence": "high",
       "reason": "No call edge exists from Reset_Handler/main or any of the 8 vector-table entries (NMI..SysTick, IRQ0..IRQ7) to dead_vulnerable_function. Static CFG reachability analysis (built from ALL entry points, not just main) must classify this as unreachable and short-circuit before emulation, per the pipeline's fast-triage design.",
       "notes": "IMPORTANT: this must be refuted via the CFG/xref graph, not by observing 'the emulator never got there in one run' -- the latter is not proof of unreachability."
+    },
+    {
+      "binary": "dead_branch.elf",
+      "function": "service_loop",
+      "line": "dead_branch_fn.s:16",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "expected_confidence": "high",
+      "reason": "service_loop is called from main, but an unconditional branch skips the overflowing stores; no path inside the function reaches them."
     }
   ]
 }

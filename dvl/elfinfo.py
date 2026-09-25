@@ -56,14 +56,16 @@ class ElfGroundTruth:
     is_thumb_entry: bool
     functions: list = field(default_factory=list)          # list[FunctionInfo], sorted by address
     mapping_points: list = field(default_factory=list)      # list[(addr, mode)], sorted
-    segments: list = field(default_factory=list)            # list[(vaddr, data)] PT_LOAD, for memory image
-    sections: dict = field(default_factory=dict)            # name -> (addr, size) for SHF_ALLOC sections
+    segments: list = field(default_factory=list)            # list[(vaddr, data)] PT_LOAD, runtime (VMA) view
+    load_images: list = field(default_factory=list)         # list[(paddr, data)] PT_LOAD whose LMA != VMA, e.g. .data's flash copy
+    sections: dict = field(default_factory=dict)            # name -> (addr, size, executable) for SHF_ALLOC sections
     symbols_by_addr: dict = field(default_factory=dict)     # addr -> name (functions + objects)
     symbols_by_name: dict = field(default_factory=dict)     # name -> addr (functions + objects)
     variables_by_function: dict = field(default_factory=dict)  # function entry addr -> list[VariableInfo]
     global_variables: dict = field(default_factory=dict)    # addr -> VariableInfo
     line_rows: list = field(default_factory=list)           # list[(addr, file_basename, line)], sorted
     has_dwarf: bool = False
+    cache: dict = field(default_factory=dict, repr=False)  # per-binary analysis results (call graph, ...)
 
     def __post_init__(self):
         self._func_starts = [f.address for f in self.functions]
@@ -274,14 +276,18 @@ def _load(path: str, elf: ELFFile) -> ElfGroundTruth:
     functions.sort(key=lambda fi: fi.address)
 
     segments = []
+    load_images = []
     for seg in elf.iter_segments():
         if seg["p_type"] == "PT_LOAD":
             segments.append((seg["p_vaddr"], seg.data()))
+            if seg["p_paddr"] != seg["p_vaddr"] and seg["p_filesz"]:
+                load_images.append((seg["p_paddr"], seg.data()))
 
     sections = {}
     for sec in elf.iter_sections():
-        if sec.name and sec["sh_flags"] & 0x2:  # SHF_ALLOC
-            sections[sec.name] = (sec["sh_addr"], sec["sh_size"])
+        flags = sec["sh_flags"]
+        if sec.name and flags & 0x2:  # SHF_ALLOC
+            sections[sec.name] = (sec["sh_addr"], sec["sh_size"], bool(flags & 0x4))  # SHF_EXECINSTR
 
     gt = ElfGroundTruth(
         path=path,
@@ -290,6 +296,7 @@ def _load(path: str, elf: ELFFile) -> ElfGroundTruth:
         functions=functions,
         mapping_points=mapping_points,
         segments=segments,
+        load_images=load_images,
         sections=sections,
         symbols_by_addr=symbols_by_addr,
         symbols_by_name=symbols_by_name,

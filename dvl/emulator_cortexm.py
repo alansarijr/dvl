@@ -97,11 +97,13 @@ class CortexM3Harness:
     def _setup_memory(self):
         self.uc.mem_map(FLASH_BASE, FLASH_SIZE)
         self.uc.mem_map(RAM_BASE, RAM_SIZE)
-        for vaddr, data in self.gt.segments:
-            if FLASH_BASE <= vaddr < FLASH_BASE + FLASH_SIZE:
-                self.uc.mem_write(vaddr, bytes(data))
-            elif RAM_BASE <= vaddr < RAM_BASE + RAM_SIZE:
-                self.uc.mem_write(vaddr, bytes(data))
+        # load_images puts initialized data at its flash (LMA) address too,
+        # where the reset handler's .data copy loop reads it from.
+        for addr, data in list(self.gt.load_images) + list(self.gt.segments):
+            if FLASH_BASE <= addr < FLASH_BASE + FLASH_SIZE:
+                self.uc.mem_write(addr, bytes(data))
+            elif RAM_BASE <= addr < RAM_BASE + RAM_SIZE:
+                self.uc.mem_write(addr, bytes(data))
 
     def set_input_queue(self, data: bytes):
         self.mmio.load_input(data)

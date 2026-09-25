@@ -1,32 +1,23 @@
 """
-Static reachability oracle (prompt pipeline step 2 -- the pre-emulation
-fast-triage filter).
+Static reachability oracle: the pre-emulation triage filter.
 
-"use angr to build a CFG from the reset vector and check whether the
-flagged address is reachable at all from any entry point (interrupt
-handlers included). Anything statically unreachable gets auto-classified
-FP without needing emulation -- saves cycles."
+A finding is refuted (FP) only when its code cannot run:
+  - its function has no path from any root in dvl.callgraph (reset
+    handler, every vector-table slot, every address-taken function), or
+  - its function is live, but no path inside the function reaches the
+    flagged instruction.
 
-We use our own capstone-based call-graph builder (dvl.callgraph) rather
-than angr (not installed in this environment; capstone-only static CFG
-recovery is a reasonable substitute for direct-call-edge reachability,
-which is all these fixtures require -- indirect calls are conservatively
-treated as "can't statically resolve", never as "definitely unreachable").
-
-Roots always include:
-  - the reset vector / ELF entry point
-  - EVERY vector-table slot (NMI, HardFault, ..., IRQ0..IRQ7) --
-    per the prompt's explicit callout, and fixture 05's whole point:
-    a handler with no incoming call edge from main() can still be very
-    reachable via hardware interrupt delivery.
+Confidence is "high" when the binary has no indirect branches in code the
+roots reach, and "medium" otherwise, because a target computed at runtime
+could escape the address-taken scan.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
+from .callgraph import CallGraph, build_callgraph, local_reachability
 from .elfinfo import ElfGroundTruth
-from .callgraph import build_callgraph, vector_table_roots, CallGraph
 from .schema import Verdict
 
 
@@ -34,66 +25,72 @@ from .schema import Verdict
 class ReachabilityResult:
     verdict: Optional[Verdict]   # Verdict.FP if unreachable; None if reachable (must proceed)
     detail: str
+    confidence: str = "high"
     callgraph: Optional[CallGraph] = None
+    facts: dict = field(default_factory=dict)
 
 
-def check(gt: ElfGroundTruth, address: int,
-          vector_table_addr: int = 4, vector_count: int = 23) -> ReachabilityResult:
-    """
-    vector_table_addr/vector_count default to skipping isr_vector[0]
-    (the initial SP value, not a code address) and covering
-    Reset_Handler + every exception/IRQ slot (isr_vector[1..23]) --
-    matching fixtures/baremetal/common/startup.s's 24-word table.
-    """
-    cg = build_callgraph(gt, extra_roots=vector_table_roots(gt, vector_table_addr, vector_count))
+def _facts(cg: CallGraph, reachable: set) -> dict:
+    live_indirect = {f: sites for f, sites in cg.indirect_sites.items() if f in reachable}
+    return {
+        "roots": [f"{label}@0x{addr:x}" for label, addr in cg.roots],
+        "vector_table": (f"0x{cg.vector_table[0]:x} x{cg.vector_table[1]}" if cg.vector_table else None),
+        "address_taken_functions": len(cg.address_taken),
+        "indirect_branch_sites": sorted(f"0x{s:x}" for sites in live_indirect.values() for s in sites),
+    }
+
+
+def check(gt: ElfGroundTruth, address: int) -> ReachabilityResult:
+    cg = build_callgraph(gt)
     reachable = cg.reachable_from_roots()
+    facts = _facts(cg, reachable)
+    confidence = "medium" if facts["indirect_branch_sites"] else "high"
+    indirect_note = (
+        f" {len(facts['indirect_branch_sites'])} indirect branch site(s) exist in reachable code; "
+        f"their targets are assumed to be among the address-taken functions."
+        if facts["indirect_branch_sites"] else " No indirect branches exist in reachable code.")
 
     func = gt.function_at(address)
     if func is None:
         return ReachabilityResult(
-            verdict=None,
+            verdict=None, callgraph=cg, facts=facts,
             detail=(f"Address 0x{address:x} does not fall inside any known function's "
-                     f"boundary -- cannot resolve a reachability verdict statically; "
-                     f"proceeding to emulation for a direct answer."),
-            callgraph=cg,
-        )
+                    f"boundary; reachability cannot be decided statically."))
 
-    if func.address in reachable:
+    if func.address not in reachable:
         return ReachabilityResult(
-            verdict=None,
-            detail=(f"Function '{func.name}' (0x{func.address:x}) IS reachable from the "
-                     f"reset vector / vector-table roots via the static call graph."),
-            callgraph=cg,
-        )
+            verdict=Verdict.FP, confidence=confidence, callgraph=cg, facts=facts,
+            detail=(f"Function '{func.name}' (0x{func.address:x}) has no call-graph path from "
+                    f"any of the {len(cg.roots)} entry points (reset handler, "
+                    f"{len(cg.roots) - len(cg.reset_roots)} vector-table slots, "
+                    f"{facts['address_taken_functions']} address-taken functions).{indirect_note}"))
 
-    root_names = ", ".join(name for name, _ in cg.roots)
+    local = local_reachability(gt, func)
+    if gt.mode_at(address) == "data":
+        return ReachabilityResult(
+            verdict=None, callgraph=cg, facts=facts,
+            detail=(f"Function '{func.name}' is reachable, but 0x{address:x} lies in a data "
+                    f"region ($d) inside it, not in code; the flagged address itself is suspect."))
+    if not local.gave_up and not local.covers(address):
+        return ReachabilityResult(
+            verdict=Verdict.FP, confidence=confidence, callgraph=cg, facts=facts,
+            detail=(f"Function '{func.name}' (0x{func.address:x}) is reachable, but no control-flow "
+                    f"path from its entry reaches 0x{address:x}: the flagged instruction is dead "
+                    f"code inside a live function.{indirect_note}"))
+
+    note = f" (intra-function walk incomplete: {local.reason})" if local.gave_up else ""
     return ReachabilityResult(
-        verdict=Verdict.FP,
-        detail=(f"Function '{func.name}' (0x{func.address:x}) has NO call-graph path from "
-                 f"any of the {len(cg.roots)} static entry points considered "
-                 f"({root_names}). Statically unreachable -- classified FP without "
-                 f"needing emulation, per the pipeline's fast-triage design."),
-        callgraph=cg,
-    )
+        verdict=None, callgraph=cg, facts=facts,
+        detail=(f"Function '{func.name}' (0x{func.address:x}) is reachable from the static "
+                f"entry points{note}."))
 
 
-def is_irq_only(gt: ElfGroundTruth, address: int,
-                 vector_table_addr: int = 4, vector_count: int = 23) -> bool:
-    """True if the flagged address is reachable ONLY via a vector-table
-    root (interrupt/exception delivery) and has NO path from the reset
-    vector's own call graph -- i.e. a handler that main()'s code never
-    calls directly, fixture 05's whole scenario. Used by pipeline.py to
-    pick a driving strategy: a plain reset-vector run will never reach
-    an IRQ-only handler, no matter how long it's allowed to execute, so
-    it must instead be seeded directly at the handler's own entry point."""
+def is_irq_only(gt: ElfGroundTruth, address: int) -> bool:
+    """True if the flagged function is reachable only through a vector-table
+    slot (interrupt/exception delivery), so a run from the reset handler
+    can never reach it and emulation must be seeded at the handler."""
     func = gt.function_at(address)
     if func is None:
         return False
-
-    main_only_cg = build_callgraph(gt)
-    if func.address in main_only_cg.reachable_from_roots():
-        return False
-
-    full_cg = build_callgraph(gt, extra_roots=vector_table_roots(gt, vector_table_addr, vector_count))
-    return func.address in full_cg.reachable_from_roots()
-
+    cg = build_callgraph(gt)
+    return func.address in cg.reachable_from_roots() and func.address not in cg.reachable_from_reset()
