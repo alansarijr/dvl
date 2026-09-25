@@ -5,6 +5,7 @@
     {
       "binary": "bad.elf",
       "function": "handle_command",
+      "line": "bad.c:34",
       "cwe": "CWE-121",
       "expected_verdict": "TP",
       "expected_confidence": "high",
@@ -17,6 +18,7 @@
     {
       "binary": "good.elf",
       "function": "handle_command_safe",
+      "line": "good.c:21",
       "cwe": "CWE-121",
       "expected_verdict": "FP",
       "expected_confidence": "high",

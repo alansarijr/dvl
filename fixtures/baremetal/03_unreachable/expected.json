@@ -5,6 +5,7 @@
     {
       "binary": "bad.elf",
       "function": "dead_vulnerable_function",
+      "line": "bad.c:22",
       "cwe": "CWE-121",
       "expected_verdict": "FP",
       "expected_confidence": "high",

@@ -1,0 +1,23 @@
+{
+  "fixture": "09_stale_frame",
+  "description": "A function's stack slot is reused by its caller after it returns. Accesses made after the frame is gone must not be attributed to its locals.",
+  "cases": [
+    {
+      "binary": "bad.elf",
+      "function": "fill_status",
+      "line": "bad.c:15",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "reason": "fill_status writes 24 bytes into buf[8] while its own frame is live."
+    },
+    {
+      "binary": "good.elf",
+      "function": "fill_status",
+      "line": "good.c:18",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "reason": "fill_status stays in bounds; main's later writes to its own local are unrelated.",
+      "xfail": "point 2: frame bases outlive the function's return"
+    }
+  ]
+}

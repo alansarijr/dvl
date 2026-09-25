@@ -41,15 +41,6 @@ class CallGraph:
         return seen
 
 
-def _read_bytes(gt: ElfGroundTruth, addr: int, size: int) -> Optional[bytes]:
-    for vaddr, data in gt.segments:
-        if vaddr <= addr < vaddr + len(data):
-            off = addr - vaddr
-            end = min(off + size, len(data))
-            return data[off:end]
-    return None
-
-
 def _disasm_function_calls(gt: ElfGroundTruth, func) -> set:
     """Disassemble one function's byte range and collect branch/call targets
     that land on a *known* function entry point (direct calls/tail-branches
@@ -57,7 +48,7 @@ def _disasm_function_calls(gt: ElfGroundTruth, func) -> set:
     conservatively ignored, same limitation any static CFG builder has)."""
     targets = set()
     size = func.size if func.size > 0 else 4096  # guard against zero-size syms
-    data = _read_bytes(gt, func.address, size)
+    data = gt.read_bytes(func.address, size)
     if not data:
         return targets
 
@@ -116,7 +107,7 @@ def vector_table_roots(gt: ElfGroundTruth, vector_table_addr: int, count: int) -
     entry point, which per the prompt must be treated as reachable
     independent of main()'s call graph."""
     roots = []
-    data = _read_bytes(gt, vector_table_addr, count * 4)
+    data = gt.read_bytes(vector_table_addr, count * 4)
     if not data:
         return roots
     for i in range(count):

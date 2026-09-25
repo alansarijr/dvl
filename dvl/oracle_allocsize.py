@@ -31,7 +31,6 @@ from typing import Optional
 import capstone as cs
 
 from .elfinfo import ElfGroundTruth
-from .callgraph import _read_bytes
 from .schema import Verdict
 
 
@@ -46,7 +45,7 @@ _SP_REGS = {"sp"}
 
 
 def _disasm_one(gt: ElfGroundTruth, addr: int):
-    data = _read_bytes(gt, addr, 8)
+    data = gt.read_bytes(addr, 8)
     if not data:
         return None
     mode = gt.mode_at(addr)

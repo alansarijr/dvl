@@ -5,6 +5,7 @@
     {
       "binary": "bad.elf",
       "function": "UART0_IRQHandler",
+      "line": "bad.c:34",
       "cwe": "CWE-121",
       "expected_verdict": "TP",
       "expected_confidence": "high",

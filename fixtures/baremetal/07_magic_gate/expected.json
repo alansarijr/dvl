@@ -5,7 +5,7 @@
     {
       "binary": "bad.elf",
       "function": "handle_command_gated",
-      "address": "0x134",
+      "line": "bad.c:32",
       "cwe": "CWE-121",
       "expected_verdict": "TP",
       "expected_confidence": "medium",
@@ -15,7 +15,7 @@
     {
       "binary": "good.elf",
       "function": "handle_command_gated_safe",
-      "address": "0x13a",
+      "line": "good.c:26",
       "cwe": "CWE-121",
       "expected_verdict": "FP",
       "expected_confidence": "medium",

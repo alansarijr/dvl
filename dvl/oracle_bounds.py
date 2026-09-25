@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .elfinfo import VariableInfo
+from .elfinfo import FunctionInfo, VariableInfo
 from .emulator_cortexm import MemAccess, RAM_BASE, RAM_SIZE, FLASH_BASE, FLASH_SIZE
 from .schema import Verdict
 
@@ -50,7 +50,7 @@ WRITE_CWES = {"CWE-121", "CWE_121", "CWE-787", "CWE_787"}
 MAX_PLAUSIBLE_OVERRUN = 4096
 
 
-def _window_for_access(var: VariableInfo, owning_function: str, acc: MemAccess) -> Optional[tuple]:
+def _window_for_access(var: VariableInfo, owning_function: FunctionInfo, acc: MemAccess) -> Optional[tuple]:
     """Resolve the variable's concrete address window using the frame-base
     snapshot captured AT THE TIME of this specific access (acc.frame_bases),
     not a single run-wide snapshot. This matters because a function can be
@@ -61,7 +61,7 @@ def _window_for_access(var: VariableInfo, owning_function: str, acc: MemAccess) 
     size = var.byte_size or 1
     if var.is_global:
         return (var.address, var.address + size)
-    fb = acc.frame_bases.get(owning_function)
+    fb = acc.frame_bases.get(owning_function.address)
     if fb is None:
         return None
     lo = fb + var.fbreg_offset
@@ -100,7 +100,7 @@ def _contained_in_sibling(acc_lo: int, acc_hi: int, var: VariableInfo,
     return False
 
 
-def check(cwe_id: str, var: VariableInfo, owning_function: str, run_result,
+def check(cwe_id: str, var: VariableInfo, owning_function: FunctionInfo, run_result,
           all_function_vars: Optional[list] = None,
           function_entry_addrs: Optional[set] = None) -> BoundsOracleResult:
 
@@ -151,7 +151,7 @@ def check(cwe_id: str, var: VariableInfo, owning_function: str, run_result,
     if var.is_global:
         var_resolvable = True
     else:
-        var_resolvable = run_result.entry_sp_snapshots.get(owning_function) is not None
+        var_resolvable = run_result.entry_sp_snapshots.get(owning_function.address) is not None
 
     last_window = None
     saw_any_resolvable_access = False
@@ -208,7 +208,7 @@ def check(cwe_id: str, var: VariableInfo, owning_function: str, run_result,
             continue
 
         if all_function_vars is not None:
-            cfa = acc.frame_bases.get(owning_function)
+            cfa = acc.frame_bases.get(owning_function.address)
             if _contained_in_sibling(acc_lo, acc_hi, var, all_function_vars, cfa):
                 # A legitimate access to a *different* declared variable
                 # (local or global) that happens to sit immediately
@@ -239,7 +239,7 @@ def check(cwe_id: str, var: VariableInfo, owning_function: str, run_result,
         return BoundsOracleResult(
             verdict=Verdict.INCONCLUSIVE,
             detail=(f"Could not resolve a concrete address window for variable "
-                    f"'{var.name}' (owning function '{owning_function}' never "
+                    f"'{var.name}' (owning function '{owning_function.name}' never "
                     f"executed during this run, so its frame base was never "
                     f"observed)."),
         )
@@ -253,7 +253,7 @@ def check(cwe_id: str, var: VariableInfo, owning_function: str, run_result,
         if var.is_global:
             last_window = (var.address, var.address + (var.byte_size or 1))
         else:
-            fb = run_result.entry_sp_snapshots[owning_function]
+            fb = run_result.entry_sp_snapshots[owning_function.address]
             lo = fb + var.fbreg_offset
             last_window = (lo, lo + (var.byte_size or 1))
 

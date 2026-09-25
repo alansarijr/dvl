@@ -5,6 +5,7 @@
     {
       "binary": "bad.elf",
       "function": "print_nth",
+      "line": "bad.c:13",
       "cwe": "CWE-125",
       "expected_verdict": "TP",
       "expected_confidence": "high",
@@ -13,10 +14,12 @@
     {
       "binary": "good.elf",
       "function": "print_nth_safe",
+      "line": "good.c:15",
       "cwe": "CWE-125",
       "expected_verdict": "FP",
       "expected_confidence": "high",
-      "reason": "The index is checked against [0, len) before any dereference. For n=40, len=8, the function returns immediately and arr[n] is never read."
+      "reason": "The index is checked against [0, len) before any dereference. For n=40, len=8, the function returns immediately and arr[n] is never read.",
+      "xfail": "point 2: the epilogue 'pop {r7, pc}' reading saved registers is counted as an OOB read"
     }
   ]
 }

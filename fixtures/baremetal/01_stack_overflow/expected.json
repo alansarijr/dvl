@@ -5,6 +5,7 @@
     {
       "binary": "bad.elf",
       "function": "vulnerable_copy",
+      "line": "bad.c:17",
       "cwe": "CWE-121",
       "expected_verdict": "TP",
       "expected_confidence": "high",
@@ -13,6 +14,7 @@
     {
       "binary": "good.elf",
       "function": "safe_copy",
+      "line": "good.c:16",
       "cwe": "CWE-121",
       "expected_verdict": "FP",
       "expected_confidence": "high",

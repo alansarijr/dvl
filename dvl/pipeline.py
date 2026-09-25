@@ -48,7 +48,6 @@ from typing import Optional
 from . import elfinfo, oracle_allocsize, oracle_reachability, oracle_bounds, oracle_pathsolve
 from .emulator_cortexm import CortexM3Harness, RAM_BASE, RAM_SIZE
 from .schema import Finding, Verdict, VerdictRecord, Evidence, EngineTier
-from .callgraph import _read_bytes
 
 GENERIC_ISR_PAYLOAD = bytes([ord('A')] * 16)              # no '\n' -> any index-reset logic never fires
 GENERIC_RESET_PAYLOAD = bytes([ord('A')] * 64) + b'\n'     # generous, terminated, for UART-fed loops
@@ -62,7 +61,7 @@ def _looks_like_cortexm_fixture_target(gt: elfinfo.ElfGroundTruth) -> bool:
     initial SP (in some RAM-like high region) or isr_vector[1] doesn't
     equal the ELF entry point, this is not that kind of target and full
     dynamic verification is not attempted."""
-    data = _read_bytes(gt, 0x0, 8)
+    data = gt.read_bytes(0x0, 8)
     if not data or len(data) < 8:
         return False
     initial_sp = int.from_bytes(data[0:4], "little")
@@ -99,17 +98,17 @@ def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, fun
                         f"site and input fed through the UART RX MMIO queue).")
 
     candidates = []   # list[(var, owning_function, sibling_vars_or_None)]
-    local_vars = gt.variables_by_function.get(func.name, [])
+    local_vars = gt.variables_for(func)
     global_vars = list(gt.global_variables.values())
     for v in local_vars:
-        candidates.append((v, func.name, local_vars))
+        candidates.append((v, func, local_vars))
     for v in global_vars:
         # Sibling set includes other globals (so a global laid out right
         # next to `v` in .bss/.data isn't misattributed as `v` overflowing
         # -- see oracle_bounds._contained_in_sibling) but deliberately NOT
         # local_vars: locals live in a different function's stack frame
         # entirely, never adjacent to a global in any meaningful sense.
-        candidates.append((v, func.name, global_vars))
+        candidates.append((v, func, global_vars))
 
     if not candidates:
         return VerdictRecord(

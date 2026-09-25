@@ -1,0 +1,38 @@
+{
+  "fixture": "10_optimized",
+  "description": "Fixture 04 built with -O2 and -Os: locals described by DWARF location lists, helpers inlined.",
+  "cases": [
+    {
+      "binary": "bad-O2.elf",
+      "function": "handle_command",
+      "line": "bad.c:34",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "reason": "Fixture 04's unchecked cmd[i] write, built optimized."
+    },
+    {
+      "binary": "good-O2.elf",
+      "function": "handle_command_safe",
+      "line": "good.c:21",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "reason": "Fixture 04's bounds-checked twin, built optimized."
+    },
+    {
+      "binary": "bad-Os.elf",
+      "function": "handle_command",
+      "line": "bad.c:34",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "reason": "Fixture 04's unchecked cmd[i] write, built optimized."
+    },
+    {
+      "binary": "good-Os.elf",
+      "function": "handle_command_safe",
+      "line": "good.c:21",
+      "cwe": "CWE-121",
+      "expected_verdict": "FP",
+      "reason": "Fixture 04's bounds-checked twin, built optimized."
+    }
+  ]
+}

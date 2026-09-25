@@ -1,20 +1,24 @@
 """
 ELF/DWARF ground-truth extraction.
 
-Per the prompt's "Known Hard Problems": we do NOT trust the upstream
-SAST tool's function-boundary or ARM/Thumb mode determination blindly.
-This module independently re-derives both directly from the ELF/DWARF,
-which is the actual source of truth cwe_checker/r2 themselves had to
-guess at.
+We do not trust the upstream SAST tool's function boundaries or ARM/Thumb
+mode. Both are re-derived here from the ELF symbol table, mapping symbols
+and DWARF, which is the information the upstream tools had to guess at.
 """
 from __future__ import annotations
 
 import bisect
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
+from elftools.dwarf.locationlists import LocationParser, LocationExpr
+
+DW_OP_addr = 0x03
+DW_OP_fbreg = 0x91
+DW_OP_call_frame_cfa = 0x9C
 
 
 @dataclass
@@ -38,10 +42,9 @@ class VariableInfo:
     name: str
     byte_size: Optional[int]
     is_global: bool
-    # For globals: absolute address. For locals: frame-relative offset
-    # (DW_OP_fbreg SLEB128 operand); resolve against the runtime frame
-    # base register value (r7 for GCC ARM -O0 / -mthumb) to get the
-    # concrete address at emulation time.
+    # Globals: absolute address. Locals: offset from the owning function's
+    # frame base, which is only kept when that frame base is the CFA (the
+    # SP value at function entry), so the emulator can resolve it exactly.
     address: Optional[int] = None
     fbreg_offset: Optional[int] = None
 
@@ -54,23 +57,35 @@ class ElfGroundTruth:
     functions: list = field(default_factory=list)          # list[FunctionInfo], sorted by address
     mapping_points: list = field(default_factory=list)      # list[(addr, mode)], sorted
     segments: list = field(default_factory=list)            # list[(vaddr, data)] PT_LOAD, for memory image
+    sections: dict = field(default_factory=dict)            # name -> (addr, size) for SHF_ALLOC sections
     symbols_by_addr: dict = field(default_factory=dict)     # addr -> name (functions + objects)
-    variables_by_function: dict = field(default_factory=dict)  # func_name -> list[VariableInfo]
-    global_variables: dict = field(default_factory=dict)    # var_name -> VariableInfo
+    symbols_by_name: dict = field(default_factory=dict)     # name -> addr (functions + objects)
+    variables_by_function: dict = field(default_factory=dict)  # function entry addr -> list[VariableInfo]
+    global_variables: dict = field(default_factory=dict)    # addr -> VariableInfo
+    line_rows: list = field(default_factory=list)           # list[(addr, file_basename, line)], sorted
+    has_dwarf: bool = False
+
+    def __post_init__(self):
+        self._func_starts = [f.address for f in self.functions]
 
     def mode_at(self, addr: int) -> str:
-        """Resolve ARM vs Thumb at an arbitrary address via mapping symbols
-        ($a / $t / $d), the ground truth the ELF toolchain itself emitted --
-        independent of whatever cwe_checker/upstream disassembly guessed."""
+        """ARM vs Thumb at an address, from the toolchain's own mapping
+        symbols ($a / $t / $d), independent of any upstream disassembly."""
         idx = bisect.bisect_right(self.mapping_points, (addr, "\xff")) - 1
         if idx < 0:
             return "thumb" if self.is_thumb_entry else "arm"
         return self.mapping_points[idx][1]
 
     def function_at(self, addr: int) -> Optional[FunctionInfo]:
-        for f in self.functions:
+        idx = bisect.bisect_right(self._func_starts, addr) - 1
+        # Aliases share a start address (and may have size 0), so try each.
+        while idx >= 0:
+            f = self.functions[idx]
             if f.contains(addr):
                 return f
+            if idx == 0 or self._func_starts[idx - 1] != f.address:
+                return None
+            idx -= 1
         return None
 
     def function_by_name(self, name: str) -> Optional[FunctionInfo]:
@@ -79,44 +94,110 @@ class ElfGroundTruth:
                 return f
         return None
 
+    def variables_for(self, func: FunctionInfo) -> list:
+        return self.variables_by_function.get(func.address, [])
 
-def _parse_variable_location(die, address_size=4) -> tuple:
+    def read_bytes(self, addr: int, size: int) -> Optional[bytes]:
+        for vaddr, data in self.segments:
+            if vaddr <= addr < vaddr + len(data):
+                off = addr - vaddr
+                return data[off:min(off + size, len(data))]
+        return None
+
+    def address_for_line(self, filename: str, line: int) -> Optional[int]:
+        """Lowest code address the line table attributes to filename:line
+        (matched on basename)."""
+        base = os.path.basename(filename)
+        addrs = [a for a, f, l in self.line_rows if f == base and l == line]
+        return min(addrs) if addrs else None
+
+    def line_for_address(self, addr: int) -> Optional[str]:
+        idx = bisect.bisect_right(self.line_rows, (addr, "\xff", 1 << 30)) - 1
+        if idx < 0:
+            return None
+        _, f, l = self.line_rows[idx]
+        return f"{f}:{l}"
+
+
+def _decode_sleb128(data) -> int:
+    result = 0
+    shift = 0
+    for b in data:
+        result |= (b & 0x7F) << shift
+        shift += 7
+        if not (b & 0x80):
+            if b & 0x40:
+                result -= (1 << shift)
+            break
+    return result
+
+
+def _parse_expr(expr, address_size: int) -> tuple:
     """Returns (kind, value) where kind is 'addr' | 'fbreg' | None."""
-    loc = die.attributes.get("DW_AT_location")
-    if loc is None:
-        return (None, None)
-    expr = loc.value
     if not expr:
         return (None, None)
     op = expr[0]
-    if op == 0x03:  # DW_OP_addr
-        addr = int.from_bytes(bytes(expr[1:1 + address_size]), "little")
-        return ("addr", addr)
-    if op == 0x91:  # DW_OP_fbreg
-        # SLEB128 decode of expr[1:]
-        result = 0
-        shift = 0
-        i = 1
-        while i < len(expr):
-            b = expr[i]
-            result |= (b & 0x7F) << shift
-            shift += 7
-            i += 1
-            if not (b & 0x80):
-                if b & 0x40:
-                    result -= (1 << shift)
-                break
-        return ("fbreg", result)
+    if op == DW_OP_addr:
+        return ("addr", int.from_bytes(bytes(expr[1:1 + address_size]), "little"))
+    if op == DW_OP_fbreg:
+        return ("fbreg", _decode_sleb128(expr[1:]))
     return (None, None)
 
 
-def _type_byte_size(die, cu) -> Optional[int]:
+def _parse_variable_location(die, loc_parser: LocationParser, address_size: int = 4) -> tuple:
+    """Returns (kind, value) where kind is 'addr' | 'fbreg' | None.
+
+    A location list (the norm at -O1 and above) is only accepted when every
+    entry agrees on the same frame-base offset; anything else, such as a
+    variable that lives in a register for part of its lifetime, is left
+    unresolved rather than guessed at."""
+    attr = die.attributes.get("DW_AT_location")
+    if attr is None:
+        return (None, None)
     try:
-        type_ref = die.attributes.get("DW_AT_type")
-        if type_ref is None:
+        loc = loc_parser.parse_from_attribute(attr, die.cu["version"], die)
+    except Exception:
+        return (None, None)
+    if isinstance(loc, LocationExpr):
+        return _parse_expr(loc.loc_expr, address_size)
+    kinds = {_parse_expr(e.loc_expr, address_size) for e in loc if hasattr(e, "loc_expr")}
+    if len(kinds) == 1:
+        return kinds.pop()
+    return (None, None)
+
+
+def _follow(die, attr_name: str):
+    """Attribute lookup that follows abstract_origin / specification, so
+    inlined and out-of-line instances get the name and type of their
+    abstract declaration."""
+    seen = 0
+    while die is not None and seen < 8:
+        if attr_name in die.attributes:
+            return die, die.attributes[attr_name]
+        nxt = None
+        for link in ("DW_AT_abstract_origin", "DW_AT_specification"):
+            if link in die.attributes:
+                nxt = die.get_DIE_from_attribute(link)
+                break
+        die = nxt
+        seen += 1
+    return None, None
+
+
+def _die_name(die) -> Optional[str]:
+    _, attr = _follow(die, "DW_AT_name")
+    if attr is None:
+        return None
+    val = attr.value
+    return val.decode("utf-8", "replace") if isinstance(val, bytes) else str(val)
+
+
+def _type_byte_size(die) -> Optional[int]:
+    try:
+        owner, attr = _follow(die, "DW_AT_type")
+        if attr is None:
             return None
-        type_die = die.get_DIE_from_attribute("DW_AT_type")
-        return _resolve_type_size(type_die)
+        return _resolve_type_size(owner.get_DIE_from_attribute("DW_AT_type"))
     except Exception:
         return None
 
@@ -152,9 +233,12 @@ def _resolve_type_size(type_die, depth=0) -> Optional[int]:
 
 
 def load(path: str) -> ElfGroundTruth:
-    f = open(path, "rb")
-    elf = ELFFile(f)
+    with open(path, "rb") as f:
+        elf = ELFFile(f)
+        return _load(path, elf)
 
+
+def _load(path: str, elf: ELFFile) -> ElfGroundTruth:
     entry = elf.header["e_entry"]
     is_thumb_entry = bool(entry & 1)
     entry &= ~1
@@ -162,6 +246,7 @@ def load(path: str) -> ElfGroundTruth:
     functions = []
     mapping_points = []
     symbols_by_addr = {}
+    symbols_by_name = {}
 
     for section in elf.iter_sections():
         if not isinstance(section, SymbolTableSection):
@@ -179,9 +264,11 @@ def load(path: str) -> ElfGroundTruth:
                 addr = val & ~1
                 mode = "thumb" if (val & 1) else "arm"
                 functions.append(FunctionInfo(name=name, address=addr, size=size, mode=mode))
-                symbols_by_addr[addr] = name
-            elif stt == "STT_OBJECT" and name:
-                symbols_by_addr[val] = name
+                symbols_by_addr.setdefault(addr, name)
+                symbols_by_name[name] = addr
+            elif stt in ("STT_OBJECT", "STT_NOTYPE") and name and not name.startswith("$"):
+                symbols_by_addr.setdefault(val, name)
+                symbols_by_name[name] = val
 
     mapping_points.sort(key=lambda t: t[0])
     functions.sort(key=lambda fi: fi.address)
@@ -189,8 +276,12 @@ def load(path: str) -> ElfGroundTruth:
     segments = []
     for seg in elf.iter_segments():
         if seg["p_type"] == "PT_LOAD":
-            data = seg.data()
-            segments.append((seg["p_vaddr"], data))
+            segments.append((seg["p_vaddr"], seg.data()))
+
+    sections = {}
+    for sec in elf.iter_sections():
+        if sec.name and sec["sh_flags"] & 0x2:  # SHF_ALLOC
+            sections[sec.name] = (sec["sh_addr"], sec["sh_size"])
 
     gt = ElfGroundTruth(
         path=path,
@@ -199,40 +290,78 @@ def load(path: str) -> ElfGroundTruth:
         functions=functions,
         mapping_points=mapping_points,
         segments=segments,
+        sections=sections,
         symbols_by_addr=symbols_by_addr,
+        symbols_by_name=symbols_by_name,
     )
 
-    # DWARF: locals (fbreg) grouped by enclosing function, globals (addr) flat.
     if elf.has_dwarf_info():
         dwinfo = elf.get_dwarf_info()
+        gt.has_dwarf = True
+        loc_parser = LocationParser(dwinfo.location_lists())
         for cu in dwinfo.iter_CUs():
-            root = cu.get_top_DIE()
-            _walk_dwarf(root, cu, gt, current_function=None)
+            _walk_dwarf(cu.get_top_DIE(), gt, loc_parser, current_function=None)
+            _collect_lines(dwinfo, cu, gt)
+        gt.line_rows.sort()
 
-    f.close()
     return gt
 
 
-def _walk_dwarf(die, cu, gt: ElfGroundTruth, current_function: Optional[str]):
+def _collect_lines(dwinfo, cu, gt: ElfGroundTruth):
+    lineprog = dwinfo.line_program_for_CU(cu)
+    if lineprog is None:
+        return
+    file_entries = lineprog["file_entry"]
+    base = 0 if lineprog["version"] >= 5 else 1
+    for entry in lineprog.get_entries():
+        st = entry.state
+        if st is None or st.end_sequence or not st.is_stmt:
+            continue
+        idx = st.file - base
+        if not 0 <= idx < len(file_entries):
+            continue
+        name = file_entries[idx].name
+        name = name.decode("utf-8", "replace") if isinstance(name, bytes) else name
+        gt.line_rows.append((st.address & ~1, os.path.basename(name), st.line))
+
+
+def _frame_base_is_cfa(die, loc_parser: LocationParser) -> bool:
+    attr = die.attributes.get("DW_AT_frame_base")
+    if attr is None:
+        return False
+    try:
+        loc = loc_parser.parse_from_attribute(attr, die.cu["version"], die)
+    except Exception:
+        return False
+    return isinstance(loc, LocationExpr) and list(loc.loc_expr) == [DW_OP_call_frame_cfa]
+
+
+def _walk_dwarf(die, gt: ElfGroundTruth, loc_parser: LocationParser,
+                current_function: Optional[int], fbreg_ok: bool = False):
+    """current_function is the entry address of the concrete function whose
+    frame the DIE's locals live in. Declarations and abstract instances have
+    no low_pc and therefore no frame; their children are skipped. Inlined
+    subroutines keep the enclosing function, since their locals are
+    addressed from its frame base."""
     if die.tag == "DW_TAG_subprogram":
-        name_attr = die.attributes.get("DW_AT_name")
-        if name_attr is not None:
-            current_function = name_attr.value.decode("utf-8", "replace")
+        low_pc = die.attributes.get("DW_AT_low_pc")
+        if low_pc is None:
+            current_function, fbreg_ok = None, False
+        else:
+            current_function = low_pc.value & ~1
+            fbreg_ok = _frame_base_is_cfa(die, loc_parser)
             gt.variables_by_function.setdefault(current_function, [])
 
     if die.tag in ("DW_TAG_variable", "DW_TAG_formal_parameter"):
-        name_attr = die.attributes.get("DW_AT_name")
-        if name_attr is not None:
-            name = name_attr.value.decode("utf-8", "replace")
-            kind, value = _parse_variable_location(die)
-            size = _type_byte_size(die, cu)
+        name = _die_name(die)
+        if name is not None:
+            kind, value = _parse_variable_location(die, loc_parser)
             if kind == "addr":
-                vi = VariableInfo(name=name, byte_size=size, is_global=True, address=value)
-                gt.global_variables[name] = vi
-            elif kind == "fbreg":
-                vi = VariableInfo(name=name, byte_size=size, is_global=False, fbreg_offset=value)
-                if current_function is not None:
-                    gt.variables_by_function.setdefault(current_function, []).append(vi)
+                gt.global_variables[value] = VariableInfo(
+                    name=name, byte_size=_type_byte_size(die), is_global=True, address=value)
+            elif kind == "fbreg" and current_function is not None and fbreg_ok:
+                gt.variables_by_function[current_function].append(VariableInfo(
+                    name=name, byte_size=_type_byte_size(die), is_global=False, fbreg_offset=value))
 
     for child in die.iter_children():
-        _walk_dwarf(child, cu, gt, current_function)
+        _walk_dwarf(child, gt, loc_parser, current_function, fbreg_ok)

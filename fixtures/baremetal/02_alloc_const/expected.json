@@ -5,6 +5,7 @@
     {
       "binary": "good.elf",
       "function": "large_but_constant_frame",
+      "locate": "prologue_sub_sp",
       "cwe": "CWE-789",
       "expected_verdict": "FP",
       "expected_confidence": "high",

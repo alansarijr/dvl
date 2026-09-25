@@ -36,7 +36,8 @@ dvl/
 fixtures/baremetal/       7 bad/good ELF fixture pairs + expected.json
                           ground truth, covering every "hard problem"
                           named in the brief (see below)
-run_fixtures.py           end-to-end fixture validator (11/11 passing)
+tests/                    pytest suite: every fixture case goes through
+                          pipeline.adjudicate, plus end-to-end sample runs
 main.py                   CLI: run the pipeline against a real SAST report
 ```
 
@@ -46,9 +47,12 @@ main.py                   CLI: run the pipeline against a real SAST report
 # Set up the venv (angr is a heavy dependency -- kept out of system Python)
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
+.venv/bin/pip install pytest
+
 # Rebuild all fixtures from source and validate the pipeline against them
-cd fixtures/baremetal && make all && cd ../..
-.venv/bin/python3 run_fixtures.py
+make -C fixtures/baremetal all
+.venv/bin/pytest                 # everything (~2 min, angr cases included)
+.venv/bin/pytest -m "not slow"   # skips angr and whole-sample runs
 
 # Run the full pipeline against the real-world sample
 .venv/bin/python3 main.py "Firmware Samples/row_413_bad.arm.elf" "Firmware Samples/result.json" --json /tmp/report.json

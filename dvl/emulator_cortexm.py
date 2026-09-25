@@ -58,8 +58,7 @@ class RunResult:
     instructions_executed: int = 0
     mmio: Optional[MmioModel] = None
     accesses: list = field(default_factory=list)          # list[MemAccess], filtered to RAM/monitored range
-    frame_base_snapshots: dict = field(default_factory=dict)  # func_name -> last-seen R7 (unused by oracle; diagnostic)
-    entry_sp_snapshots: dict = field(default_factory=dict)    # func_name -> SP at entry == DWARF CFA
+    entry_sp_snapshots: dict = field(default_factory=dict)    # func entry addr -> SP at entry == DWARF CFA
     exit_code: Optional[int] = None
 
 
@@ -77,13 +76,11 @@ class CortexM3Harness:
         self._instr_count = 0
         self._max_instructions = DEFAULT_MAX_INSTRUCTIONS
         self._accesses: list = []
-        self._frame_bases: dict = {}
-        self._entry_sp: dict = {}           # func_name -> SP value at function entry == DWARF CFA
+        self._entry_sp: dict = {}           # func entry addr -> SP value at function entry == DWARF CFA
         self._monitor_ranges: list = []     # list[(lo,hi)] restrict access-trace collection (perf)
         self._stop_reason = None
         self._fault_detail = None
-        self._func_ranges = [(f.address, f.end, f.name) for f in gt.functions]
-        self._func_entry_addr = {f.address: f.name for f in gt.functions}
+        self._func_entries = {f.address for f in gt.functions}
         # Hooks are registered exactly once per harness instance (not per
         # run_from() call) so that run_from() can be invoked repeatedly on
         # the same instance -- e.g. fixture 05 seeds execution at an ISR
@@ -126,13 +123,8 @@ class CortexM3Harness:
         # address the compiler generated, instead of guessing an offset
         # from r7 (which depends on that function's specific
         # push/sub-sp prologue and isn't a fixed relationship).
-        fname = self._func_entry_addr.get(address)
-        if fname is not None:
-            self._entry_sp[fname] = uc.reg_read(UC_ARM_REG_SP)
-        for lo, hi, name in self._func_ranges:
-            if lo <= address < hi:
-                self._frame_bases[name] = uc.reg_read(UC_ARM_REG_R7)
-                break
+        if address in self._func_entries:
+            self._entry_sp[address] = uc.reg_read(UC_ARM_REG_SP)
 
     def _mem_hook(self, uc, access, address, size, value, user_data):
         is_write = (access == UC_MEM_WRITE)
@@ -208,7 +200,6 @@ class CortexM3Harness:
             instructions_executed=self._instr_count,
             mmio=self.mmio,
             accesses=self._accesses,
-            frame_base_snapshots=dict(self._entry_sp),
             entry_sp_snapshots=dict(self._entry_sp),
             exit_code=self.mmio.sim_exit_code,
 
