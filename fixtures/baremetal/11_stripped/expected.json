@@ -1,0 +1,25 @@
+{
+  "fixture": "11_stripped",
+  "description": "Fixture 01 with debug info stripped (symbols kept), as most shipped firmware is. No DWARF means no buffer sizes; the return-address oracle must still confirm the overflow, and the safe twin cannot be cleared.",
+  "cases": [
+    {
+      "binary": "bad.elf",
+      "function": "vulnerable_copy",
+      "line": "bad.c:17",
+      "debug_twin": "../01_stack_overflow/bad.elf",
+      "cwe": "CWE-121",
+      "expected_verdict": "TP",
+      "expected_confidence": "high",
+      "reason": "mem_copy writes 64 bytes into a 16-byte buffer and runs over vulnerable_copy's saved LR."
+    },
+    {
+      "binary": "good.elf",
+      "function": "safe_copy",
+      "line": "good.c:16",
+      "debug_twin": "../01_stack_overflow/good.elf",
+      "cwe": "CWE-121",
+      "expected_verdict": "Inconclusive",
+      "reason": "The copy is clamped, but with no DWARF an overflow that stops short of the saved registers would be invisible, so the tool must not claim FP."
+    }
+  ]
+}

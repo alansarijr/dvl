@@ -22,7 +22,7 @@ from typing import Optional
 from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UcError
 from unicorn.arm_const import (
     UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
-    UC_ARM_REG_SP, UC_ARM_REG_LR,
+    UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_PC,
 )
 from unicorn.unicorn_const import (
     UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UC_HOOK_MEM_READ, UC_MEM_WRITE,
@@ -40,6 +40,7 @@ RAM_SIZE = 0x00010000        # 64K, matches linker.ld
 LR_SENTINEL = 0xFFFFFFFE     # unmapped; landing here on return = "function returned"
 DEFAULT_MAX_INSTRUCTIONS = 2_000_000
 EXCEPTION_FRAME_BYTES = 32   # r0-r3, r12, lr, pc, xpsr stacked by hardware on exception entry
+SAVED_LR_SEARCH_BYTES = 64   # push {r4-r11, lr} is the widest prologue save
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class Frame:
     activation: int    # unique per call
     cfa: int           # SP at entry == DWARF CFA
     ret: int           # return address (LR at entry, Thumb bit cleared)
+    lr: int = 0        # raw LR at entry, as the prologue will push it
 
 
 @dataclass
@@ -76,6 +78,8 @@ class RunResult:
     mmio: Optional[MmioModel] = None
     accesses: list = field(default_factory=list)          # list[MemAccess], cumulative across runs
     watch_hits: dict = field(default_factory=dict)        # watched addr -> times executed
+    saved_lr_slots: dict = field(default_factory=dict)    # activation -> address its prologue pushed LR to
+    fault_target: Optional[int] = None                    # PC value execution faulted trying to fetch
     exit_code: Optional[int] = None
 
     @property
@@ -119,6 +123,7 @@ class CortexM3Harness:
         self._live: tuple = ()
         self._rets: Counter = Counter()
         self._activations = itertools.count(1)
+        self._lr_slots: dict = {}
         # Registered once per instance: registering per run_from() call would
         # stack duplicate callbacks and multiply-count every access.
         self.uc.hook_add(UC_HOOK_CODE, self._code_hook)
@@ -181,8 +186,9 @@ class CortexM3Harness:
             # A new frame at or above an existing one means that one is
             # gone (tail call, or a return we did not see).
             self._pop_returned(sp)
+            lr = uc.reg_read(UC_ARM_REG_LR)
             frame = Frame(func=address, activation=next(self._activations), cfa=sp,
-                          ret=uc.reg_read(UC_ARM_REG_LR) & ~1)
+                          ret=lr & ~1, lr=lr)
             self._stack.append(frame)
             self._rets[frame.ret] += 1
             self._live = tuple(self._stack)
@@ -194,6 +200,13 @@ class CortexM3Harness:
         if self._monitor_ranges and not any(lo <= address < hi for lo, hi in self._monitor_ranges):
             return
         is_write = access == UC_MEM_WRITE
+        if is_write and self._stack:
+            top = self._stack[-1]
+            # The prologue's push stores LR just below the CFA: remember
+            # where, so later writes to that slot can be recognized.
+            if (value == top.lr and top.activation not in self._lr_slots
+                    and top.cfa - SAVED_LR_SEARCH_BYTES <= address < top.cfa):
+                self._lr_slots[top.activation] = address
         self._accesses.append(MemAccess(
             pc=self._pc, address=address, size=size, is_write=is_write,
             value=value if is_write else None, frames=self._live))
@@ -226,7 +239,7 @@ class CortexM3Harness:
         self._instr_count = 0
         self._set_stack([])
 
-        fault_pc = None
+        fault_pc = fault_target = None
         try:
             # entry_addr | 1 forces Thumb state for the initial branch.
             self.uc.emu_start(entry_addr | 1, LR_SENTINEL)
@@ -235,6 +248,7 @@ class CortexM3Harness:
                 self._stop_reason = "fault"
                 self._fault_detail = str(e)
                 fault_pc = self._pc
+                fault_target = self.uc.reg_read(UC_ARM_REG_PC)
 
         if self._stop_reason is None:
             if self.mmio.sim_exit_requested:
@@ -254,6 +268,8 @@ class CortexM3Harness:
             mmio=self.mmio,
             accesses=self._accesses,
             watch_hits=dict(self._watch_hits),
+            saved_lr_slots=dict(self._lr_slots),
+            fault_target=fault_target,
             exit_code=self.mmio.sim_exit_code,
         )
 

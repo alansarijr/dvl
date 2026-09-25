@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import elfinfo, oracle_allocsize, oracle_reachability, oracle_bounds, oracle_pathsolve
+from . import elfinfo, oracle_allocsize, oracle_reachability, oracle_bounds, oracle_pathsolve, oracle_retaddr
 from .emulator_cortexm import CortexM3Harness
 from .schema import Finding, Verdict, VerdictRecord, Evidence, EngineTier
 
@@ -98,28 +98,47 @@ def _drive(gt: elfinfo.ElfGroundTruth, finding: Finding, func, irq_only: bool):
     return run_result, desc
 
 
+def _check_run(gt, finding: Finding, func, run_result):
+    """Runs the trigger oracles on one run. Returns (tp, kind, detail,
+    objects_known): the DWARF bounds oracle first, then, for write CWEs,
+    the return-address oracle, which also works without debug info."""
+    res = oracle_bounds.check(gt, finding.cwe_id, func, run_result)
+    if res.verdict == Verdict.TP:
+        return True, "bounds", res.detail, res.objects_known
+    if finding.cwe_id in oracle_bounds.WRITE_CWES:
+        ra = oracle_retaddr.check(gt, func, run_result, bytes(run_result.mmio.input_queue))
+        if ra.verdict == Verdict.TP:
+            return True, "retaddr", ra.detail, res.objects_known
+        if res.objects_known == 0:
+            return False, "retaddr", ra.detail, 0
+    return False, "bounds", res.detail, res.objects_known
+
+
 def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, func) -> VerdictRecord:
     irq_only = oracle_reachability.is_irq_only(gt, finding.address)
     run_result, driver_desc = _drive(gt, finding, func, irq_only)
-    res = oracle_bounds.check(gt, finding.cwe_id, func, run_result)
+    tp, kind, detail, objects_known = _check_run(gt, finding, func, run_result)
     exercised = run_result.watch_hits.get(finding.address, 0) > 0
 
     def record(verdict, confidence, detail, notes="", tier=EngineTier.A_FULL_DYNAMIC, kind="bounds"):
         return VerdictRecord(finding_id=finding.finding_id, verdict=verdict, confidence=confidence,
                              engine_tier=tier, evidence=Evidence(kind=kind, detail=detail), notes=notes)
 
-    if res.verdict == Verdict.TP:
-        return record(Verdict.TP, "high", f"[{driver_desc}] {res.detail}")
+    if tp:
+        return record(Verdict.TP, "high", f"[{driver_desc}] {detail}", kind=kind)
 
-    if res.objects_known == 0 and exercised:
+    if objects_known == 0 and exercised:
         return record(Verdict.INCONCLUSIVE, "low",
-                      f"[{driver_desc}] The flagged instruction executed, but there are no "
-                      f"DWARF-described objects to check its accesses against.",
-                      notes="Needs debug info (DWARF locals/globals) or manual review.")
+                      f"[{driver_desc}] The flagged instruction executed. {detail} There are no "
+                      f"DWARF-described objects, so an overflow that stops short of the saved "
+                      f"registers would go unseen.",
+                      notes="No debug info: the return-address check can confirm a stack smash "
+                            "but cannot clear a finding. Needs DWARF or manual review.",
+                      kind=kind)
 
     if exercised:
         return record(Verdict.FP, "high", f"[{driver_desc}] Flagged instruction executed "
-                                          f"{run_result.watch_hits[finding.address]} time(s). {res.detail}")
+                                          f"{run_result.watch_hits[finding.address]} time(s). {detail}")
 
     if run_result.deterministic and not irq_only:
         return record(Verdict.FP, "high",
@@ -140,17 +159,17 @@ def _run_generic_dynamic_check(gt: elfinfo.ElfGroundTruth, finding: Finding, fun
             harness.set_input_queue(solved.uart_bytes)
             replay = harness.run_from(func.address, r0=solved.args[0], r1=solved.args[1],
                                       r2=solved.args[2], r3=solved.args[3])
-            replay_res = oracle_bounds.check(gt, finding.cwe_id, func, replay)
+            r_tp, r_kind, r_detail, r_objects = _check_run(gt, finding, func, replay)
             replay_hit = replay.watch_hits.get(finding.address, 0) > 0
             notes = ("Driven by an angr-solved input from the flagged function's own entry, "
                      "not from reset: this shows the bug can be triggered once that function "
                      "runs with these arguments and bytes, not that reset leads there with them. "
                      "Medium confidence for that reason.")
-            if replay_res.verdict == Verdict.TP:
-                return record(Verdict.TP, "medium", f"[{solved.detail}] {replay_res.detail}",
+            if r_tp:
+                return record(Verdict.TP, "medium", f"[{solved.detail}] {r_detail}",
                               notes=notes, tier=EngineTier.B_PARTIAL_DYNAMIC, kind="pathsolve")
-            if replay_hit and replay_res.objects_known:
-                return record(Verdict.FP, "medium", f"[{solved.detail}] {replay_res.detail}",
+            if replay_hit and r_objects:
+                return record(Verdict.FP, "medium", f"[{solved.detail}] {r_detail}",
                               notes=notes, tier=EngineTier.B_PARTIAL_DYNAMIC, kind="pathsolve")
 
     return record(Verdict.INCONCLUSIVE, "low",

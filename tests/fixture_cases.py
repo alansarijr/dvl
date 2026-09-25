@@ -50,8 +50,11 @@ def build_finding(fixture_dir: Path, case: dict):
     assert func is not None, f"{case['function']} not in {case['binary']}"
 
     if "line" in case:
+        # A stripped binary has no line table; its byte-identical debug
+        # build ("debug_twin") provides the address.
+        line_gt = load_gt(str((fixture_dir / case["debug_twin"]).resolve())) if "debug_twin" in case else gt
         filename, line = case["line"].rsplit(":", 1)
-        address = gt.address_for_line(filename, int(line))
+        address = line_gt.address_for_line(filename, int(line))
         assert address is not None, f"no code for {case['line']} in {case['binary']}"
     elif case.get("locate") == "prologue_sub_sp":
         address = _prologue_sub_sp(gt, func)
