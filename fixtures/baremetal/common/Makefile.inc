@@ -9,6 +9,10 @@
 # because it's resolved from each fixture's own directory (make -C ...).
 COMMON_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 
+# Included before each fixture's own `all:` rule, so without this the
+# first rule below (clean-common) would become the default goal.
+.DEFAULT_GOAL := all
+
 
 CC       := arm-none-eabi-gcc
 OBJDUMP  := arm-none-eabi-objdump
@@ -19,7 +23,7 @@ CFLAGS := -mcpu=cortex-m3 -mthumb -O0 -g3 -gdwarf-4 \
           -ffreestanding -fno-builtin -fno-common \
           -Wall -Wextra -I$(COMMON_DIR)
 
-LDFLAGS := -nostdlib -T $(COMMON_DIR)/linker.ld \
+LDFLAGS = -nostdlib -T $(COMMON_DIR)/linker.ld \
            -Wl,-Map=$(basename $@).map -Wl,--build-id=none
 
 %.elf: %.c $(COMMON_DIR)/startup.s $(COMMON_DIR)/linker.ld $(COMMON_DIR)/mmio.h
