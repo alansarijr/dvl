@@ -10,6 +10,8 @@ Full dynamic verification targets **ARM Cortex-M** (Unicorn). Other images
 get static checks only (reachability, CWE-789) and are otherwise reported as
 Inconclusive with the reason.
 
+**Full usage and testing guide: [docs/USAGE.md](docs/USAGE.md).**
+
 ## Running
 
 ```bash
