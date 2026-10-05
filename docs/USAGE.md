@@ -25,6 +25,7 @@ new test cases). For how the tool decides verdicts internally, see the
 | What | Why | Needed for |
 |------|-----|------------|
 | Python ≥ 3.11 | uses the standard-library `tomllib` | everything |
+| Python ≥ 3.12 | the pinned `angr==9.3.2` is 3.12-only | the angr path-solve fallback |
 | `arm-none-eabi-gcc` toolchain | builds the test fixtures | rebuilding fixtures only |
 | `cwe_checker` | produces SAST reports | only if you generate reports yourself |
 
@@ -41,7 +42,7 @@ Choose an extra to match what you need:
 | Command | Installs |
 |---------|----------|
 | `pip install -e .` | Core only (pyelftools, capstone, unicorn). Findings that need input solving stay Inconclusive. |
-| `pip install -e '.[angr]'` | Core plus the angr path-solve fallback (a large download). |
+| `pip install -e '.[angr]'` | Core plus the angr path-solve fallback (a large download). On Python 3.11 angr is skipped and you get core only. |
 | `pip install -e '.[dev]'` | Everything above, plus the test tools. |
 
 Dependency versions are pinned in `pyproject.toml` and `requirements.txt`
@@ -570,3 +571,15 @@ files. The `.map` and `.lst` build outputs are git-ignored.
 To reproduce a real-world false verdict, first build the smallest program
 that shows it, then add it as a fixture with `xfail` describing the problem.
 Remove the `xfail` once it's fixed.
+
+## Exit codes and empty reports
+
+| Exit | Meaning |
+|---|---|
+| 0 | Ran to completion. A valid report with **zero findings** also exits 0 and (with `--json`) writes `[]`. |
+| 1 | The report had records but none were usable (e.g. no `addresses`), or its shape was unrecognized. Per-record reasons are printed to stderr as `warning: skipped ...`. |
+| 2 | The report file could not be read or is not valid JSON. |
+
+Accepted report shapes: a top-level list, or an object with the list under
+`findings` (also `results`, `report`, `data`). A record's address comes from
+`addresses[0]`, or a singular `address`.

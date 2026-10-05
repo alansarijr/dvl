@@ -24,10 +24,27 @@ def main():
     ap.add_argument("--json", help="also write the JSON report to this path")
     args = ap.parse_args()
 
-    findings = ingest.load_report(args.sast_report)
+    skipped: list = []
+    try:
+        findings = ingest.load_report(args.sast_report, skipped)
+    except (OSError, ValueError) as e:
+        print(f"Cannot read SAST report {args.sast_report}: {e}", file=sys.stderr)
+        sys.exit(2)
+    for reason in skipped:
+        print(f"warning: skipped {reason}", file=sys.stderr)
     if not findings:
-        print("No findings parsed from report.", file=sys.stderr)
-        sys.exit(1)
+        if skipped:
+            # Records were present but none usable: the report format is
+            # wrong, which the caller needs to know about.
+            print(f"No findings parsed from report: all {len(skipped)} record(s) skipped.", file=sys.stderr)
+            sys.exit(1)
+        # A valid report with nothing in it is a clean result, not a failure.
+        print("0 findings in report; nothing to adjudicate.")
+        if args.json:
+            with open(args.json, "w") as f:
+                f.write(report.to_json([]))
+            print(f"JSON report written to {args.json}")
+        return
 
     profile = target.load(args.target) if args.target else None
     if args.svd:

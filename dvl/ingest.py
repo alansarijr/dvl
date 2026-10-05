@@ -54,22 +54,54 @@ def _confidence(raw: dict) -> float:
         return 0.0
 
 
-def load_report(path: str) -> list:
+_WRAPPER_KEYS = ("findings", "results", "report", "data")
+
+
+def _records(data) -> list:
+    """The record list from either accepted shape, or a wrapper dict using
+    one of a few common keys. Anything else yields no records."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in _WRAPPER_KEYS:
+            if isinstance(data.get(key), list):
+                return data[key]
+    return []
+
+
+def load_report(path: str, skipped: Optional[list] = None) -> list:
+    """Parse a report file. `skipped`, if given, collects one reason string
+    per record that could not be turned into a Finding."""
     with open(path) as f:
         data = json.load(f)
-    return list(parse_findings(data))
+    if skipped is not None and not isinstance(data, list) and not any(
+            isinstance(data.get(k), list) for k in _WRAPPER_KEYS):
+        skipped.append(f"report: unrecognized shape (no list under any of {', '.join(_WRAPPER_KEYS)})")
+    return list(parse_findings(data, skipped))
 
 
-def parse_findings(data) -> Iterable[Finding]:
-    records = data if isinstance(data, list) else data.get("findings", [])
+
+def parse_findings(data, skipped: Optional[list] = None) -> Iterable[Finding]:
+    records = _records(data)
     seen_ids: dict = {}
     for i, raw in enumerate(records):
-        tids = raw.get("tids") or []
-        addrs = raw.get("addresses") or []
-        if not addrs:
+        if not isinstance(raw, dict):
+            if skipped is not None:
+                skipped.append(f"record {i}: not an object")
             continue
-        addr = _parse_address(addrs[0], tids)
+        tids = raw.get("tids") or []
+        addrs = raw.get("addresses") or ([raw["address"]] if raw.get("address") not in (None, "") else [])
+        if not addrs:
+            if skipped is not None:
+                skipped.append(f"record {i}: no 'addresses'")
+            continue
+        try:
+            addr = _parse_address(addrs[0], tids)
+        except ValueError:
+            addr = None
         if addr is None:
+            if skipped is not None:
+                skipped.append(f"record {i}: unparseable address {addrs[0]!r}")
             continue
 
         finding_id = str(tids[0]) if tids else f"finding_{i}"
